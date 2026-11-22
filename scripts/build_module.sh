@@ -34,6 +34,7 @@ if [ -d "$STAGE_DIR/system" ] || [ -d "$STAGE_DIR/vendor" ]; then
 fi
 
 mkdir -p "$(dirname "$OUT_ZIP")"
+OUT_ZIP="$(cd "$(dirname "$OUT_ZIP")" && pwd)/$(basename "$OUT_ZIP")"
 rm -f "$OUT_ZIP"
 (
   cd "$STAGE_DIR"
