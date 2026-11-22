@@ -1,0 +1,22 @@
+# Rust
+daemon/target/
+**/*.rs.bk
+
+# Android / Gradle
+app/.gradle/
+app/build/
+app/app/build/
+app/local.properties
+app/.idea/
+*.iml
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Release outputs & temp
+dist/
+out/
+*.zip
+*.sha256
+.DS_Store

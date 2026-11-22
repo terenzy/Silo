@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      STRICT OFFLINE-FIRST INVARIANT:
+      Silo intentionally strips android.permission.INTERNET even if any transitive library declares it.
+      Zero background network access, zero telemetry, zero external servers.
+    -->
+    <uses-permission
+        android:name="android.permission.INTERNET"
+        tools:node="remove" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".SiloApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Silo">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.Silo" />
+
+        <!-- Primary launcher entry (can be toggled off when App Disguise is enabled) -->
+        <activity-alias
+            android:name=".LauncherDefault"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Optional neutral stealth disguise launcher entry -->
+        <activity-alias
+            android:name=".LauncherDisguise"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_disguise"
+            android:label="@string/app_name_disguise"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Quick Settings Tile 1: Firewall Strict Lockdown (Default-Deny) -->
+        <service
+            android:name=".tiles.LockdownTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile_lockdown"
+            android:label="@string/tile_lockdown"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Quick Settings Tile 2: Hardware Sensors Off (Mic + Cam) -->
+        <service
+            android:name=".tiles.SensorsOffTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile_sensors"
+            android:label="@string/tile_sensors"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Quick Settings Tile 3: 2-Tap Confirmed Panic Reboot to BFU -->
+        <service
+            android:name=".tiles.PanicRebootTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile_panic"
+            android:label="@string/tile_panic"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>

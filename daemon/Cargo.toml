@@ -1,0 +1,22 @@
+[package]
+name = "silod"
+version = "1.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Silo kernel-backed privacy and security root daemon for Android Linux 6.x"
+
+[[bin]]
+name = "silod"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
