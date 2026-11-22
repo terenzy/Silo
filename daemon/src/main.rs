@@ -12,29 +12,35 @@ mod sys;
 mod telemetry;
 
 use crate::automation::{
-    execute_clean_bfu_reboot, get_private_dns, set_private_dns, AutomationEngine,
-    PANIC_REBOOT_CONFIRM_TOKEN,
+    disable_wifi_and_bt_now, execute_clean_bfu_reboot, get_private_dns, get_radio_privacy,
+    set_private_dns, set_radio_privacy, AutomationEngine, PANIC_REBOOT_CONFIRM_TOKEN,
 };
 use crate::config::{
     is_protected_package, is_protected_uid, validate_cidr, validate_package_name, AppFirewallRule,
-    AppIsolationScope, FreezeMode, SiloConfig, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH,
-    DEFAULT_STATE_DIR, MAX_BLOCKLIST_ENTRIES,
+    AppIsolationScope, FirewallMode, FreezeMode, SiloConfig, DEFAULT_CONFIG_PATH,
+    DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR, MAX_BLOCKLIST_ENTRIES,
 };
 use crate::firewall::{apply_firewall, ensure_hook_jumps, flush_firewall, probe_capabilities};
 use crate::freezer::FreezerEngine;
 use crate::hardening::HardeningEngine;
 use crate::ipc::{run_ipc_server, run_single_rpc, run_stdio_bridge};
 use crate::netlink::{
-    classify_active_interfaces, destroy_matching_connection, destroy_uid_sockets,
-    list_active_connections, run_nflog_loop, SILO_NFLOG_GROUP,
+    classify_active_interfaces, destroy_all_user_sockets, destroy_matching_connection,
+    destroy_uid_sockets, list_active_connections, run_nflog_loop, SILO_NFLOG_GROUP,
 };
 use crate::protocol::{
     ActiveInterfaces, DaemonCommand, DaemonStatus, IpcRequest, IpcResponse, KernelCapabilities,
+    PanicLockdownReport,
 };
-use crate::scopes::{apply_app_scope, clear_app_scope, sync_all_scopes, ClipboardGuard};
+use crate::scopes::{
+    apply_app_scope, bulk_revoke_category, clear_app_scope, get_privacy_access_log,
+    inspect_app_permissions, set_app_permission_action, sync_all_scopes, ClipboardGuard,
+    PermissionEnforcer,
+};
 use crate::sentinel::{run_live_proof, run_sentinel_audit};
 use crate::sys::{
-    boottime_secs, detect_device_locked, detect_screen_on, is_ce_unlocked, read_uid_package_map,
+    boottime_secs, detect_device_locked, detect_screen_on, foreground_app_uids, is_ce_unlocked,
+    read_uid_package_map,
 };
 use crate::telemetry::TelemetryRing;
 
@@ -96,6 +102,7 @@ struct DaemonState {
     hardening: HardeningEngine,
     automation: AutomationEngine,
     clipboard: ClipboardGuard,
+    enforcer: PermissionEnforcer,
 }
 
 impl DaemonState {
@@ -141,6 +148,7 @@ impl DaemonState {
             hardening: HardeningEngine::new(),
             automation: AutomationEngine::new(),
             clipboard: ClipboardGuard::new(),
+            enforcer: PermissionEnforcer::new(),
         }
     }
 
@@ -220,6 +228,15 @@ impl DaemonState {
             })
             .collect();
 
+        let sp = self.automation.live_sensor_privacy();
+        let enforcer_rules_count: usize = self
+            .config
+            .scopes
+            .guards
+            .values()
+            .map(|g| g.auto_revoke_on_bg.len() + g.locked_deny.len())
+            .sum();
+
         DaemonStatus {
             version: DAEMON_VERSION.to_string(),
             pid: std::process::id(),
@@ -235,7 +252,9 @@ impl DaemonState {
             screen_on: self.screen_on,
             device_locked: self.device_locked,
             ce_unlocked: self.ce_unlocked,
-            sensors_off_active: self.automation.sensors_off_active(),
+            sensors_off_active: sp.mic_muted || sp.camera_muted,
+            mic_muted: sp.mic_muted,
+            camera_muted: sp.camera_muted,
             frozen_uids_count: self.freezer.currently_frozen().len(),
             suspended_pkgs_count: self.freezer.suspended_packages().len(),
             blocked_events_total: total_blocked,
@@ -245,6 +264,10 @@ impl DaemonState {
                 self.device_locked,
             ),
             private_dns: get_private_dns(),
+            radio_privacy: get_radio_privacy(),
+            enforcer_rules_count,
+            enforcer_actions_count: self.enforcer.actions_count,
+            last_enforcer_event: self.enforcer.last_event.clone(),
             temp_unblocks_remaining,
             capabilities: self.caps.clone(),
             last_firewall_error: self.last_firewall_error.clone(),
@@ -730,6 +753,69 @@ fn dispatch_command(
             }
         }
 
+        DaemonCommand::InspectAppPermissions { package_name } => {
+            IpcResponse::ok(id, inspect_app_permissions(&package_name))
+        }
+
+        DaemonCommand::SetAppPermissionAction {
+            package_name,
+            category,
+            action,
+        } => match set_app_permission_action(&package_name, &category, &action) {
+            Ok(live) => IpcResponse::ok(id, live),
+            Err(e) => IpcResponse::err(id, e),
+        },
+
+        DaemonCommand::SetAppPermGuard {
+            package_name,
+            guard,
+        } => {
+            if !validate_package_name(&package_name) || is_protected_package(&package_name) {
+                return IpcResponse::err(
+                    id,
+                    format!("Invalid or protected package: {}", package_name),
+                );
+            }
+            let Ok(mut st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            if guard.is_empty() {
+                st.config.scopes.guards.remove(&package_name);
+            } else {
+                st.config.scopes.guards.insert(package_name.clone(), guard.clone());
+            }
+            let _ = st.config.sanitize();
+            if let Err(e) = st.save_config() {
+                return IpcResponse::err(id, e);
+            }
+            // Immediately apply any newly locked categories
+            if let Some(saved_guard) = st.config.scopes.guards.get(&package_name).cloned() {
+                for cat in &saved_guard.locked_deny {
+                    let _ = set_app_permission_action(&package_name, cat, "revoke");
+                }
+            }
+            IpcResponse::ok(id, &st.config.scopes)
+        }
+
+        DaemonCommand::BulkRevokeCategory { category, packages } => {
+            match bulk_revoke_category(&category, &packages) {
+                Ok(revoked) => IpcResponse::ok(
+                    id,
+                    serde_json::json!({ "category": category, "revoked_count": revoked }),
+                ),
+                Err(e) => IpcResponse::err(id, e),
+            }
+        }
+
+        DaemonCommand::GetPrivacyAccessLog { limit } => {
+            let uid_map = state_mtx
+                .lock()
+                .map(|s| s.uid_map.clone())
+                .unwrap_or_default();
+            let events = get_privacy_access_log(&uid_map, limit.unwrap_or(80));
+            IpcResponse::ok(id, events)
+        }
+
         DaemonCommand::SetHardeningConfig { config } => {
             let Ok(mut st) = state_mtx.lock() else {
                 return IpcResponse::err(id, "state lock poisoned");
@@ -782,8 +868,18 @@ fn dispatch_command(
             let Ok(mut st) = state_mtx.lock() else {
                 return IpcResponse::err(id, "state lock poisoned");
             };
-            match st.automation.set_sensors_off_manual(enabled) {
-                Ok(()) => IpcResponse::ok(id, serde_json::json!({ "sensors_off": enabled })),
+            match st.automation.set_sensor_privacy("all", enabled) {
+                Ok(live) => IpcResponse::ok(id, live),
+                Err(e) => IpcResponse::err(id, e),
+            }
+        }
+
+        DaemonCommand::SetSensorPrivacy { sensor, enabled } => {
+            let Ok(mut st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            match st.automation.set_sensor_privacy(&sensor, enabled) {
+                Ok(live) => IpcResponse::ok(id, live),
                 Err(e) => IpcResponse::err(id, e),
             }
         }
@@ -795,6 +891,56 @@ fn dispatch_command(
                 Ok(dns) => IpcResponse::ok(id, dns),
                 Err(e) => IpcResponse::err(id, e),
             }
+        }
+
+        DaemonCommand::GetRadioPrivacy => IpcResponse::ok(id, get_radio_privacy()),
+
+        DaemonCommand::SetRadioPrivacy {
+            enhanced_mac_randomization,
+            disable_wifi_ble_scanning,
+            disable_captive_portal,
+        } => match set_radio_privacy(
+            enhanced_mac_randomization,
+            disable_wifi_ble_scanning,
+            disable_captive_portal,
+        ) {
+            Ok(rp) => IpcResponse::ok(id, rp),
+            Err(e) => IpcResponse::err(id, e),
+        },
+
+        DaemonCommand::TriggerPanicLockdown => {
+            let Ok(mut st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            st.config.firewall.enabled = true;
+            st.config.firewall.mode = FirewallMode::DefaultDeny;
+            st.temp_unblock_until.clear();
+            let _ = st.save_config();
+            let firewall_locked = st.sync_firewall().is_ok();
+            let sockets_destroyed = if st.caps.sock_destroy_available {
+                destroy_all_user_sockets()
+            } else {
+                0
+            };
+            let sp = st
+                .automation
+                .set_sensor_privacy("all", true)
+                .unwrap_or_else(|_| st.automation.live_sensor_privacy());
+            let (wifi_disabled, bluetooth_disabled) = disable_wifi_and_bt_now();
+            let clipboard_cleared = st.clipboard.clear_now().is_ok();
+
+            IpcResponse::ok(
+                id,
+                PanicLockdownReport {
+                    firewall_locked,
+                    sockets_destroyed,
+                    mic_muted: sp.mic_muted,
+                    camera_muted: sp.camera_muted,
+                    wifi_disabled,
+                    bluetooth_disabled,
+                    clipboard_cleared,
+                },
+            )
         }
 
         DaemonCommand::TriggerPanicReboot { confirm_token } => {
@@ -986,6 +1132,13 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
                 let freezer_cfg = st.config.freezer.clone();
                 let sd_avail = st.caps.sock_destroy_available;
                 st.freezer.policy_tick(&freezer_cfg, screen_now, sd_avail);
+
+                if !st.config.scopes.guards.is_empty() {
+                    let scopes_cfg = st.config.scopes.clone();
+                    let fg_uids = foreground_app_uids();
+                    let uid_map = st.uid_map.clone();
+                    st.enforcer.tick(&scopes_cfg, screen_now, &fg_uids, &uid_map);
+                }
 
                 if tick_count.is_multiple_of(2) {
                     let scopes_cfg = st.config.scopes.clone();

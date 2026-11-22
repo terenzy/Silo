@@ -1,6 +1,6 @@
 id=silo
-name=Silo Kernel Privacy & Security
-version=v2.0.0
-versionCode=20000
+name=Silo Kernel Privacy & Security Suite
+version=v3.0.0
+versionCode=30000
 author=terenzy
-description=Zero-panic, zero-mount native Linux 6.x kernel firewall, cgroup v2 & pm suspend freezer, GrapheneOS-inspired isolation scopes, Private DNS DoT switcher, xt_recent anti-port-scan, BFU auto-reboot, and live kernel enforcement verifier.
+description=Zero-panic, zero-mount native Linux 6.x kernel firewall, real-time permission & AppOps enforcer, privacy access audit, cgroup v2 freezer, GrapheneOS-inspired radio/USB/sysctl hardening, and live kernel verification.

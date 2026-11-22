@@ -16,6 +16,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.silo.app.ui.SiloViewModel
@@ -46,6 +49,24 @@ class MainActivity : ComponentActivity() {
 private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
     val state by vm.ui.collectAsStateWithLifecycle()
     val strings = remember(state.languagePref) { resolveStrings(state.languagePref) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    // Real-time lifecycle sync: immediately reloads live Mic/Camera sensor privacy,
+    // PackageManager granted permissions, Radio Privacy, and Daemon status on every resume!
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> vm.onForegroundChanged(true)
+                Lifecycle.Event.ON_PAUSE -> vm.onForegroundChanged(false)
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            vm.onForegroundChanged(false)
+        }
+    }
 
     SiloTheme(themePref = state.themePref) {
         CompositionLocalProvider(LocalSiloStrings provides strings) {

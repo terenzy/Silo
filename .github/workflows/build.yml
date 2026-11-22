@@ -174,7 +174,7 @@ jobs:
           elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
             TAG="${{ github.event.inputs.release_tag }}"
           else
-            TAG="v2.0.0-$(date -u +%Y%m%d-%H%M)"
+            TAG="v3.0.0-$(date -u +%Y%m%d-%H%M)"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -201,7 +201,7 @@ jobs:
             "release_out/silo-ksu-module-${TAG}.zip" \
             "release_out/SHA256SUMS.txt" \
             --title "Silo ${TAG}" \
-            --notes "Silo ${TAG} — Zero-panic native Linux 6.x kernel privacy & security suite (static ARM64 Rust \`silod\` KernelSU Module + strict offline-first Kotlin/Compose APK with verified zero \`INTERNET\` permission). Includes real kernel enforcement fixes (\`iptables-restore --noflush -w\`, IPC u32 map key fix, auto-degrade fallback), Live Proof verifier, Temporary Internet Unblock timer, 1-click Private DNS (DoT), Anti-Port-Scan (\`xt_recent\`), Offline Privacy Risk & Tracker Scanner, bilingual Indonesian/English UI, and borderless minimalist 4-tab redesign. Note: update BOTH the KernelSU module ZIP (and reboot) and the APK." \
+            --notes "Silo ${TAG} — Zero-panic, zero-gimmick Linux 6.x kernel privacy & security suite (static ARM64 Rust \`silod\` KernelSU Module + strict offline-first Kotlin/Compose APK with verified zero \`INTERNET\` permission). v3.0.0 upgrades: real-time separated Mic/Camera live state (\`dumpsys sensor_privacy\`), honest per-app Permissions & AppOps controller (\`pm revoke\` + 4-mode AppOps + Auto-Revoke on Close & Strict Lock Enforcer), Global Permission Audit + Bulk Revoke, Real-Time Privacy Access Timeline (\`dumpsys appops --op\`), granted-based Risk Breakdown & Mitigation, GrapheneOS-aligned Radio Privacy & safe USB/ADB Lockscreen Guard, 1-tap non-destructive Panic Lockdown, and extra reversible kernel sysctls. Note: update BOTH the KernelSU module ZIP (and reboot) and the APK." \
             $PRE_FLAG || \
           gh release upload "$TAG" \
             "release_out/Silo-${TAG}.apk" \

@@ -23,40 +23,39 @@
 
 ---
 
-## Feature Pillars (v2.0.0)
+## Feature Pillars (v3.0.0)
 
 1. **Kernel Firewall & Anti-Leak Engine (`iptables-restore --noflush -w` + native Netlink `ipset`)**
    - **Dual-Mode**: starts in safe `Default-Allow`, switchable anytime to strict `Default-Deny` (with `REJECT` fast-fail or silent `DROP`, plus Quick Settings Tile).
    - **Auto-Degrade OEM Resilience**: automatically degrades optional targets (`NFLOG`/`TTL`/`HL`/`xt_recent`/`xt_set`) if an OEM `iptables` binary omits a module, and isolates IPv6 errors so IPv4 enforcement never fails.
-   - **MediaTek & Multi-SoC Interface Awareness**: `wlan+`/`swlan+`, MediaTek `ccmni+`/`v4-ccmni+`, Qualcomm/Exynos `rmnet+`/`pdp+`/`clat+`, and VPN `tun+`/`wg+`/`ppp+`/`ipsec+`.
-   - **Per-App Matrix & Temporary Unblock**: Wi-Fi, Cellular, VPN, LAN allowlist, Screen-Off/Background block, Cleartext HTTP (port 80) block, Localhost (`127.0.0.1`) isolation, VPN-App exemption, **Temporary Internet Unblock Timer (15m / 30m / 60m)** with automatic kernel re-lock + `SOCK_DESTROY`, and instant **`SOCK_DESTROY`** (`CONFIG_INET_DIAG_DESTROY=y`) to sever established TCP sockets in `<1 ms`.
-   - **Global Guards**: LAN/RFC1918/multicast isolation, DNS Leak Guard, IPv6 VPN Leak Guard, **Anti-Port-Scan & Inbound Flood Guard (`xt_recent`)**, TTL/HL normalization (`64`), Auto-Block newly installed apps, and local SAF-imported IP/CIDR blocklists via atomic pure-Rust Netlink `ipset`.
-2. **Real-Time RAM-Only Traffic Monitor & Live Proof Verifier**
-   - **Live Enforcement Proof**: real-time verification against live kernel tables (`iptables -w -C OUTPUT -j SILO_OUT`, active rule counts in `SILO_OUT`/`SILO_IN` IPv4/IPv6, live `/proc/sys` values, `cgroup.events` frozen nodes, `cmd appops get`, and Private DNS).
-   - Pure-Rust Linux Netlink `NFLOG` listener (rate-limited group 42 with per-reason tags: `SILO_UID`, `SILO_LAN`, `SILO_DNS`, `SILO_HTTP`, `SILO_IPSET`, `SILO_V6LEAK`, `SILO_SCAN`).
-   - Pure-Rust `NETLINK_SOCK_DIAG` (`inet_diag`) live IPv4/IPv6 TCP/UDP socket & listening-port inspector with 1-tap `SOCK_DESTROY` and 1-tap Block UID.
-3. **True Kernel App Freezer (`cgroup v2`) & Deep Suspend**
-   - Discovers real per-process `/proc/<pid>/cgroup` nodes and verifies `cgroup.events` (`frozen 1`) for Soft Freeze, plus real **Deep Suspend (`pm suspend --user 0` + `am force-stop`)** that prevents cold background starts, with automatic `<1 ms` foreground thaw and full clean unsuspend on shutdown/uninstall.
-4. **Privacy Controls, Private DNS (DoT) & Offline Risk Scanner**
-   - **Private DNS (DoT) 1-Click Switcher**: instant switch between Off, Auto, Quad9, Mullvad, AdGuard, Cloudflare, or custom DoT hostname via `settings put global`.
-   - **Offline Privacy Risk & Tracker Scanner**: 100% local `PackageManager` audit of sensitive permissions and known tracker SDK receivers/services (Zero internet required).
-   - **App Isolation Scopes (`appops ignore`)**: Fake-empty Contacts, Storage/Media, SMS/CallLog, Clipboard Read, Sensors, Background/Wakelock, Location, and Camera/Mic without app crashes, plus verified read-back via `cmd appops get`.
-   - **Native + Root Clipboard Clear & Auto-Clear**, **Auto-Reboot to BFU Timer + 2-Tap Panic BFU Tile**, **Wi-Fi/BT Idle Auto-Off**, and **Hardware Sensors Kill-Switch** (`cmd sensor_privacy` with `dumpsys sensor_privacy` read-back).
-5. **Kernel Exploit-Surface Hardening (`sysctl` Guard) & Stealth Sentinel**
-   - Pre-apply RAM snapshot with 1-tap full rollback (`unprivileged_bpf_disabled=2`, `bpf_jit_harden=2`, `kptr_restrict=2`, `perf_event_paranoid=3`, `suid_dumpable=0`, `tcp_timestamps=0`, VPN-safe `rp_filter=2`, IPv6 `use_tempaddr=2`, TCP BBRv3 & CAKE/FQ).
-   - Read-only live security posture score (0–100) + SUSFS/BBG/NoMount visibility + Local SAF JSON Backup/Restore + App Disguise (`Silo` ↔ `NetDiag`).
-6. **Minimalist Borderless UI, Bilingual (ID / EN) & 3 Themes**
-   - Clean 4-tab layout (`Home / Apps / Monitor / System`) with real app icons, hairline dividers, segmented pills, per-app bottom sheets, instant **Bahasa Indonesia / English / Auto** switcher, and **Obsidian / AMOLED Pure Black / Dynamic Material You** themes.
+   - **Per-App Matrix & Temporary Unblock**: Wi-Fi, Cellular (`ccmni+`/`rmnet+`), VPN, LAN allowlist, clear **Block While Screen Off**, Cleartext HTTP (port 80) block, Localhost (`127.0.0.1`) isolation, VPN-App exemption, **Temporary Internet Unblock Timer (15m / 30m / 60m)** with automatic kernel re-lock + `SOCK_DESTROY`.
+   - **Global Guards**: LAN/RFC1918/multicast isolation, DNS Leak Guard, IPv6 VPN Leak Guard, **Anti-Port-Scan (`xt_recent`)**, TTL/HL normalization (`64`), Auto-Block newly installed apps, and local SAF-imported IP/CIDR blocklists via atomic pure-Rust Netlink `ipset`.
+2. **Real-Time Permission & AppOps Enforcer + Privacy Access Timeline (Zero Gimmicks)**
+   - **Live Real-Time Sync**: syncs separated **Microphone** & **Camera** mute state directly from `dumpsys sensor_privacy`, live Android runtime grant flags (`PackageManager`), and live `cmd appops get` on every `ON_RESUME` and 4s foreground tick.
+   - **4-Mode Per-Category Controller**: Normal, Foreground-Only (`foreground`), Fake-Empty (`appops ignore`), and Real Revoke (`pm revoke` + `appops ignore`) across 10 honest categories (explicitly noting Media controls MediaStore, not POSIX `/sdcard` folder names handled by SUSFS).
+   - **Daemon Enforcer**: per-app **Auto-Revoke on Close** (revokes sensitive permissions automatically when backgrounded/screen off) and **Strict Lock** (re-enforces immediately if changed externally).
+   - **Global Permission Audit ("Who Has Access?") & Real-Time Access Timeline**: filter apps by currently granted sensitive permissions with 1-tap Bulk Revoke, plus live `dumpsys appops --op` timeline showing recent & active Mic/Camera/Location/Clipboard/Contacts accesses.
+   - **Actionable Risk Breakdown**: classifies risk from **currently granted** sensitive permissions + embedded tracker SDKs, showing exact reasons and 1-tap mitigation.
+3. **GrapheneOS-Aligned Privacy Automation, Radio Privacy & Panic Lockdown**
+   - **1-Tap Non-Destructive Panic Lockdown**: engages Default-Deny firewall, severs all active user TCP sockets (`SOCK_DESTROY`), mutes Mic & Camera, disables Wi-Fi & Bluetooth, and wipes Clipboard.
+   - **Safe USB & ADB Lockscreen Guard**: sets `adb_enabled=0` and USB charge-only via Android framework on lock (stays off on unlock; never touches hardware USB sysfs or Download Mode).
+   - **Network & Radio Privacy**: Enhanced Wi-Fi MAC Randomization, disable background Wi-Fi/BLE scanning, optional disable Google Captive Portal pings, and 1-click **Private DNS (DoT)**.
+   - **True Kernel App Freezer (`cgroup v2`) & Deep Suspend (`pm suspend`)**, Auto-Reboot to BFU (`CLOCK_BOOTTIME`), Wi-Fi/BT Idle Auto-Off, and Native + Root Clipboard Auto-Clear.
+4. **Reversible Kernel Hardening (`sysctl` Guard) & Live Proof Verifier**
+   - Pre-apply RAM snapshot with 1-tap rollback: `unprivileged_bpf_disabled=2`, `bpf_jit_harden=2`, `kptr_restrict=2`, `perf_event_paranoid=3`, `randomize_va_space=2`, `yama.ptrace_scope=2` (if supported), `suid_dumpable=0`, `tcp_timestamps=0`, `tcp_rfc1337=1`, ICMP redirect/source-route/broadcast guards, VPN-safe `rp_filter=2`, IPv6 `use_tempaddr=2`, and TCP BBRv3 / CAKE / FQ.
+   - **Live Enforcement Proof** verifies live kernel `iptables` hooks, rule counts, `/proc/sys` values, `cgroup.events`, `pm suspend`, `appops`, `sensor_privacy`, and `Private DNS`/`Radio Privacy`.
+5. **Minimalist Borderless UI, Bilingual (ID / EN) & 3 Themes**
+   - Clean 4-tab layout (`Home / Apps / Monitor / System`), instant **Auto / Bahasa Indonesia / English**, and **Obsidian / AMOLED / Dynamic** themes.
 
 ---
 
-## Installation / Upgrade to v2.0.0
+## Installation / Upgrade to v3.0.0
 
 1. Download **`silo-ksu-module-<tag>.zip`** and **`Silo-<tag>.apk`** from **GitHub Releases**.
-2. Open **KernelSU-Next → Modules → `+`**, install **`silo-ksu-module-<tag>.zip`**, and **reboot** (required so the updated `silod` v2.0.0 daemon takes effect).
+2. Open **KernelSU-Next → Modules → `+`**, install **`silo-ksu-module-<tag>.zip`**, and **reboot** (required so `silod` v3.0.0 replaces the older daemon).
 3. Install **`Silo-<tag>.apk`**.
-4. Open **KernelSU-Next → Superuser** and grant root access to **Silo** (automatically hidden on `SM-A146P-KernelSU-SUSFS` via Layer 1 `__ksu_is_allow_uid`; also add to HMA-OSS hide templates if desired).
-5. Launch **Silo** — everything starts in **Safe-First** mode (firewall, freezer, hardening, and BFU timer OFF until you enable them or select a preset).
+4. Open **KernelSU-Next → Superuser** and grant root access to **Silo**.
+5. Launch **Silo** — everything starts in **Safe-First** mode until you enable controls or pick a preset.
 
 ---
 

@@ -124,8 +124,17 @@ data class AppIsolationScope(
 }
 
 @Serializable
+data class AppPermGuard(
+    @SerialName("auto_revoke_on_bg") val autoRevokeOnBg: List<String> = emptyList(),
+    @SerialName("locked_deny") val lockedDeny: List<String> = emptyList(),
+) {
+    fun totalCount(): Int = autoRevokeOnBg.size + lockedDeny.size
+}
+
+@Serializable
 data class ScopesConfig(
     val apps: Map<String, AppIsolationScope> = emptyMap(),
+    val guards: Map<String, AppPermGuard> = emptyMap(),
     @SerialName("auto_clear_clipboard") val autoClearClipboard: Boolean = false,
     @SerialName("clipboard_clear_secs") val clipboardClearSecs: Int = 45,
 )
@@ -142,6 +151,7 @@ data class HardeningConfig(
     @SerialName("restrict_dmesg") val restrictDmesg: Boolean = true,
     @SerialName("disable_tcp_timestamps") val disableTcpTimestamps: Boolean = true,
     @SerialName("harden_network_stack") val hardenNetworkStack: Boolean = true,
+    @SerialName("harden_memory_and_ptrace") val hardenMemoryAndPtrace: Boolean = true,
     @SerialName("ipv6_privacy_extensions") val ipv6PrivacyExtensions: Boolean = true,
     @SerialName("tcp_congestion") val tcpCongestion: String = "",
     @SerialName("default_qdisc") val defaultQdisc: String = "",
@@ -156,11 +166,12 @@ data class AutomationConfig(
     @SerialName("bluetooth_auto_off_enabled") val bluetoothAutoOffEnabled: Boolean = false,
     @SerialName("bluetooth_auto_off_minutes") val bluetoothAutoOffMinutes: Int = 15,
     @SerialName("sensors_off_on_lock") val sensorsOffOnLock: Boolean = false,
+    @SerialName("usb_adb_lock_guard") val usbAdbLockGuard: Boolean = false,
 )
 
 @Serializable
 data class SiloConfig(
-    @SerialName("schema_version") val schemaVersion: Int = 2,
+    @SerialName("schema_version") val schemaVersion: Int = 3,
     val firewall: FirewallConfig = FirewallConfig(),
     val freezer: FreezerConfig = FreezerConfig(),
     val scopes: ScopesConfig = ScopesConfig(),
@@ -199,6 +210,57 @@ data class PrivateDnsState(
 )
 
 @Serializable
+data class SensorPrivacyState(
+    @SerialName("mic_muted") val micMuted: Boolean = false,
+    @SerialName("camera_muted") val cameraMuted: Boolean = false,
+)
+
+@Serializable
+data class RadioPrivacyState(
+    @SerialName("enhanced_mac_randomization") val enhancedMacRandomization: Boolean = false,
+    @SerialName("disable_wifi_ble_scanning") val disableWifiBleScanning: Boolean = false,
+    @SerialName("disable_captive_portal") val disableCaptivePortal: Boolean = false,
+    @SerialName("adb_enabled_live") val adbEnabledLive: Boolean = false,
+)
+
+@Serializable
+data class CategoryPermLiveState(
+    val category: String = "",
+    @SerialName("appops_mode") val appopsMode: String = "default",
+    @SerialName("last_access") val lastAccess: String? = null,
+    @SerialName("running_now") val runningNow: Boolean = false,
+)
+
+@Serializable
+data class AppLivePermissions(
+    @SerialName("package_name") val packageName: String = "",
+    val categories: List<CategoryPermLiveState> = emptyList(),
+)
+
+@Serializable
+data class PrivacyAccessEvent(
+    val uid: Int = 0,
+    @SerialName("package_name") val packageName: String = "",
+    val category: String = "",
+    val op: String = "",
+    val mode: String = "allow",
+    @SerialName("last_access_label") val lastAccessLabel: String = "",
+    @SerialName("age_secs") val ageSecs: Long = 0,
+    @SerialName("running_now") val runningNow: Boolean = false,
+)
+
+@Serializable
+data class PanicLockdownReport(
+    @SerialName("firewall_locked") val firewallLocked: Boolean = false,
+    @SerialName("sockets_destroyed") val socketsDestroyed: Int = 0,
+    @SerialName("mic_muted") val micMuted: Boolean = false,
+    @SerialName("camera_muted") val cameraMuted: Boolean = false,
+    @SerialName("wifi_disabled") val wifiDisabled: Boolean = false,
+    @SerialName("bluetooth_disabled") val bluetoothDisabled: Boolean = false,
+    @SerialName("clipboard_cleared") val clipboardCleared: Boolean = false,
+)
+
+@Serializable
 data class DaemonStatus(
     val version: String = "0.0.0",
     val pid: Int = 0,
@@ -215,11 +277,17 @@ data class DaemonStatus(
     @SerialName("device_locked") val deviceLocked: Boolean = false,
     @SerialName("ce_unlocked") val ceUnlocked: Boolean = true,
     @SerialName("sensors_off_active") val sensorsOffActive: Boolean = false,
+    @SerialName("mic_muted") val micMuted: Boolean = false,
+    @SerialName("camera_muted") val cameraMuted: Boolean = false,
     @SerialName("frozen_uids_count") val frozenUidsCount: Int = 0,
     @SerialName("suspended_pkgs_count") val suspendedPkgsCount: Int = 0,
     @SerialName("blocked_events_total") val blockedEventsTotal: Long = 0,
     @SerialName("auto_reboot_remaining_secs") val autoRebootRemainingSecs: Long? = null,
     @SerialName("private_dns") val privateDns: PrivateDnsState = PrivateDnsState(),
+    @SerialName("radio_privacy") val radioPrivacy: RadioPrivacyState = RadioPrivacyState(),
+    @SerialName("enforcer_rules_count") val enforcerRulesCount: Int = 0,
+    @SerialName("enforcer_actions_count") val enforcerActionsCount: Long = 0,
+    @SerialName("last_enforcer_event") val lastEnforcerEvent: String? = null,
     @SerialName("temp_unblocks_remaining") val tempUnblocksRemaining: Map<Int, Long> = emptyMap(),
     val capabilities: KernelCapabilities = KernelCapabilities(),
     @SerialName("last_firewall_error") val lastFirewallError: String? = null,

@@ -5,7 +5,7 @@ import dev.silo.app.data.AppLanguagePref
 import java.util.Locale
 
 data class SiloStrings(
-    // Bottom navigation (4 crisp short tabs - never truncated!)
+    // Bottom navigation (4 crisp short tabs)
     val tabHome: String,
     val tabApps: String,
     val tabTraffic: String,
@@ -29,7 +29,7 @@ data class SiloStrings(
     val bootGuardArmed: String,
     val metricBlocked: String,
     val metricFrozen: String,
-    val metricIsolated: String,
+    val metricEnforced: String,
 
     // Presets
     val presetsTitle: String,
@@ -43,12 +43,19 @@ data class SiloStrings(
     val presetLockdown: String,
     val presetLockdownDesc: String,
 
-    // Quick actions
+    // Quick actions & Hardware switches
     val quickActions: String,
-    val sensorsOff: String,
-    val sensorsOffShort: String,
+    val muteMic: String,
+    val muteCamera: String,
+    val stateMuted: String,
+    val stateLive: String,
     val clearClipboard: String,
     val liveProof: String,
+    val panicLockdown: String,
+    val panicLockdownSub: String,
+    val panicLockdownTitle: String,
+    val panicLockdownBody: String,
+    val confirmLockdown: String,
     val panicBfu: String,
     val panicDialogTitle: String,
     val panicDialogBody: String,
@@ -58,20 +65,37 @@ data class SiloStrings(
     val apply: String,
     val reset: String,
 
-    // Apps tab
+    // Apps tab & Global Permission Audit
     val searchApps: String,
     val filterUser: String,
     val filterRestricted: String,
+    val filterAudit: String,
     val filterSystem: String,
     val noAppsFound: String,
     val riskHigh: String,
     val riskMedium: String,
+    val riskLow: String,
     val trackersFound: String,
+    val activePermsShort: String,
     val tempUnblockActive: String,
+    val auditBanner: String,
+    val auditAllCategories: String,
+    val revokeAllVisible: String,
+    val revokeOne: String,
+    val noAppsWithPerm: String,
+
+    // Risk explanation card inside App Sheet
+    val riskWhyTitle: String,
+    val riskActivePermsLabel: String,
+    val riskDeclaredOnlyNote: String,
+    val riskTrackersLabel: String,
+    val riskFixPermsHint: String,
+    val riskFixTrackersHint: String,
+    val revokeAllSensPerms: String,
 
     // Per-app bottom sheet
     val sheetNetwork: String,
-    val sheetScopes: String,
+    val sheetPerms: String,
     val sheetFreezer: String,
     val allowWifi: String,
     val allowWifiDesc: String,
@@ -79,8 +103,8 @@ data class SiloStrings(
     val allowCellularDesc: String,
     val allowVpn: String,
     val allowVpnDesc: String,
-    val allowScreenOff: String,
-    val allowScreenOffDesc: String,
+    val blockScreenOff: String,
+    val blockScreenOffDesc: String,
     val allowLan: String,
     val allowLanDesc: String,
     val blockHttp: String,
@@ -95,25 +119,21 @@ data class SiloStrings(
     val killTcpNow: String,
     val resetNetRule: String,
 
-    // App Isolation Scopes
-    val scopesIntro: String,
-    val isolateAllHardened: String,
-    val scopeContacts: String,
-    val scopeContactsDesc: String,
-    val scopeStorage: String,
-    val scopeStorageDesc: String,
-    val scopeSmsCall: String,
-    val scopeSmsCallDesc: String,
-    val scopeClipboard: String,
-    val scopeClipboardDesc: String,
-    val scopeSensors: String,
-    val scopeSensorsDesc: String,
-    val scopeBackground: String,
-    val scopeBackgroundDesc: String,
-    val scopeLocation: String,
-    val scopeLocationDesc: String,
-    val scopeCamMic: String,
-    val scopeCamMicDesc: String,
+    // Honest Real-Time Permission & AppOps Controls
+    val permsHonestNote: String,
+    val permStateGranted: String,
+    val permStateForeground: String,
+    val permStateIgnored: String,
+    val permStateDenied: String,
+    val permStateRunning: String,
+    val permActionNormal: String,
+    val permActionFg: String,
+    val permActionIgnore: String,
+    val permActionRevoke: String,
+    val enforcerAutoRevoke: String,
+    val enforcerStrictLock: String,
+    val enforcerHint: String,
+    val lastAccessPrefix: String,
 
     // App Freezer
     val freezerIntro: String,
@@ -126,17 +146,19 @@ data class SiloStrings(
     val frozenBadge: String,
     val suspendedBadge: String,
 
-    // Traffic tab
+    // Traffic & Privacy Access tab
     val trafficBlocked: String,
     val trafficLive: String,
-    val trafficListen: String,
+    val trafficAccess: String,
     val ramOnlyBanner: String,
-    val autoRefresh: String,
+    val accessTimelineBanner: String,
     val clearRing: String,
     val noBlockedYet: String,
     val noConnections: String,
+    val noAccessEvents: String,
     val killSocket: String,
     val blockApp: String,
+    val runningNowBadge: String,
 
     // System tab sections
     val secPrivateDns: String,
@@ -144,6 +166,15 @@ data class SiloStrings(
     val dnsOff: String,
     val dnsAuto: String,
     val dnsCustom: String,
+
+    val secRadioPrivacy: String,
+    val enhancedMacRand: String,
+    val enhancedMacRandDesc: String,
+    val disableBgScan: String,
+    val disableBgScanDesc: String,
+    val disableCaptivePortal: String,
+    val disableCaptivePortalDesc: String,
+    val adbLiveWarning: String,
 
     val secGlobalNet: String,
     val fwModeLabel: String,
@@ -175,6 +206,8 @@ data class SiloStrings(
     val clearList: String,
 
     val secAutomation: String,
+    val usbAdbLockGuard: String,
+    val usbAdbLockGuardDesc: String,
     val autoRebootBfu: String,
     val autoRebootBfuDesc: String,
     val autoClearClip: String,
@@ -202,6 +235,9 @@ data class SiloStrings(
     val runLiveProofDesc: String,
     val runAuditRow: String,
     val runAuditDesc: String,
+    val grapheneNotesRow: String,
+    val grapheneNotesDesc: String,
+    val grapheneNotesBody: String,
 
     val secPreferences: String,
     val languageLabel: String,
@@ -212,7 +248,69 @@ data class SiloStrings(
     val importBackup: String,
     val emergencyFlush: String,
     val emergencyFlushDesc: String,
-)
+
+    val isIndonesian: Boolean,
+) {
+    fun categoryLabel(id: String): String = if (isIndonesian) {
+        when (id) {
+            "camera" -> "Kamera"
+            "microphone" -> "Mikrofon"
+            "location" -> "Lokasi"
+            "background_location" -> "Lokasi Latar"
+            "contacts" -> "Kontak"
+            "media" -> "Foto & Media"
+            "sms_calllog" -> "SMS & Panggilan"
+            "clipboard" -> "Clipboard"
+            "sensors" -> "Sensor Tubuh"
+            "background" -> "Latar & Overlay"
+            else -> id
+        }
+    } else {
+        when (id) {
+            "camera" -> "Camera"
+            "microphone" -> "Microphone"
+            "location" -> "Location"
+            "background_location" -> "Bg Location"
+            "contacts" -> "Contacts"
+            "media" -> "Photos & Media"
+            "sms_calllog" -> "SMS & Calls"
+            "clipboard" -> "Clipboard"
+            "sensors" -> "Body Sensors"
+            "background" -> "Background & Overlay"
+            else -> id
+        }
+    }
+
+    fun categoryDesc(id: String): String = if (isIndonesian) {
+        when (id) {
+            "camera" -> "Akses kamera depan/belakang"
+            "microphone" -> "Perekaman suara & mikrofon"
+            "location" -> "GPS & lokasi jaringan saat app dibuka"
+            "background_location" -> "Pelacakan lokasi terus-menerus di latar belakang"
+            "contacts" -> "Daftar kontak (AppOps ignore menampilkan 0 kontak)"
+            "media" -> "Galeri MediaStore (tidak menyembunyikan folder /sdcard)"
+            "sms_calllog" -> "Membaca SMS OTP & riwayat panggilan"
+            "clipboard" -> "Membaca teks yang Anda salin ke clipboard"
+            "sensors" -> "Sensor aktivitas fisik & sensor tubuh"
+            "background" -> "Jalan di latar, wakelock, overlay layar, & statistik pakai"
+            else -> ""
+        }
+    } else {
+        when (id) {
+            "camera" -> "Front and rear camera capture"
+            "microphone" -> "Audio and microphone recording"
+            "location" -> "GPS and network location while open"
+            "background_location" -> "Continuous background location tracking"
+            "contacts" -> "Contacts list (AppOps ignore returns 0 contacts)"
+            "media" -> "MediaStore gallery access (does not hide /sdcard folder names)"
+            "sms_calllog" -> "Read OTP SMS messages and call logs"
+            "clipboard" -> "Read copied clipboard text silently"
+            "sensors" -> "Physical activity and body sensors"
+            "background" -> "Background run, wakelocks, overlay, & usage stats"
+            else -> ""
+        }
+    }
+}
 
 val StringsId = SiloStrings(
     tabHome = "Beranda",
@@ -222,24 +320,24 @@ val StringsId = SiloStrings(
 
     titleHome = "Silo",
     titleApps = "Kontrol Aplikasi",
-    titleTraffic = "Lalu Lintas",
+    titleTraffic = "Monitor Real-Time",
     titleSystem = "Sistem & Keamanan",
 
     daemonOffline = "Daemon Root Offline",
-    daemonOfflineDesc = "Pasang silo-ksu-module-v2.0.0.zip di KernelSU-Next, reboot, lalu izinkan akses root untuk Silo.",
+    daemonOfflineDesc = "Pasang silo-ksu-module-v3.0.0.zip di KernelSU-Next, reboot, lalu izinkan akses root untuk Silo.",
     retryBridge = "Hubungkan Ulang",
-    securityScore = "Skor Keamanan",
+    securityScore = "Skor",
     firewallMaster = "Firewall Kernel",
     firewallActiveHint = "Aktif di Netfilter kernel • Tanpa slot VPN",
     firewallOffHint = "Nonaktif • Mode aman awal",
-    bootGuardOk = "Anti-Bootloop: Stabil",
-    bootGuardArmed = "Anti-Bootloop: Memverifikasi 45d",
+    bootGuardOk = "Boot Guard: Stabil",
+    bootGuardArmed = "Boot Guard: Verifikasi 45d",
     metricBlocked = "Diblokir",
-    metricFrozen = "Dibekukan",
-    metricIsolated = "Diisolasi",
+    metricFrozen = "Beku",
+    metricEnforced = "Penjaga Izin",
 
     presetsTitle = "Preset Cepat",
-    presetsSubtitle = "Atur proteksi dalam 1 ketukan. Auto-Reboot BFU selalu tetap manual agar aman.",
+    presetsSubtitle = "Atur proteksi dalam 1 ketukan. Auto-Reboot BFU tetap manual agar aman.",
     presetSafe = "Aman",
     presetSafeDesc = "Matikan semua blokir",
     presetBalanced = "Seimbang",
@@ -247,16 +345,23 @@ val StringsId = SiloStrings(
     presetHardened = "Ketat",
     presetHardenedDesc = "+ Blokir HTTP, TTL 64, App baru diblokir",
     presetLockdown = "Lockdown",
-    presetLockdownDesc = "Blokir semua app kecuali yang diizinkan",
+    presetLockdownDesc = "Blokir default + USB/ADB guard",
 
-    quickActions = "Aksi Cepat",
-    sensorsOff = "Matikan Sensor",
-    sensorsOffShort = "Mic & Kamera",
+    quickActions = "Kontrol Perangkat Live",
+    muteMic = "Mikrofon",
+    muteCamera = "Kamera",
+    stateMuted = "DIMATIKAN",
+    stateLive = "Aktif (Live)",
     clearClipboard = "Hapus Clipboard",
     liveProof = "Uji Nyata",
+    panicLockdown = "Panic Lockdown",
+    panicLockdownSub = "Putus Net+Mic+Cam",
+    panicLockdownTitle = "Aktifkan Panic Lockdown?",
+    panicLockdownBody = "Aksi non-destruktif (tidak menghapus data): mengaktifkan Firewall Blokir Default, memutus semua koneksi TCP aktif, mematikan Mikrofon, Kamera, Wi-Fi, Bluetooth, dan menghapus Clipboard.",
+    confirmLockdown = "Kunci Sekarang",
     panicBfu = "Reboot BFU",
     panicDialogTitle = "Reboot Darurat ke BFU?",
-    panicDialogBody = "HP akan langsung reboot bersih ke mode terkunci penuh (BFU) sehingga seluruh kunci enkripsi dihapus dari RAM.",
+    panicDialogBody = "HP akan reboot bersih ke mode terkunci penuh (BFU) sehingga seluruh kunci enkripsi dihapus dari RAM.",
     confirmReboot = "Reboot Sekarang",
     cancel = "Batal",
     close = "Tutup",
@@ -266,15 +371,31 @@ val StringsId = SiloStrings(
     searchApps = "Cari aplikasi...",
     filterUser = "Aplikasi",
     filterRestricted = "Terbatas",
+    filterAudit = "Audit Izin",
     filterSystem = "Sistem",
     noAppsFound = "Tidak ada aplikasi yang cocok.",
     riskHigh = "Risiko Tinggi",
-    riskMedium = "Sedang",
-    trackersFound = "tracker terdeteksi",
+    riskMedium = "Risiko Sedang",
+    riskLow = "Risiko Rendah",
+    trackersFound = "tracker",
+    activePermsShort = "izin aktif",
     tempUnblockActive = "Akses sementara",
+    auditBanner = "Menampilkan aplikasi yang SEDANG AKTIF diberi izin sensitif (real-time dari sistem):",
+    auditAllCategories = "Semua",
+    revokeAllVisible = "Cabut Semua",
+    revokeOne = "Cabut",
+    noAppsWithPerm = "Tidak ada aplikasi aktif yang memegang izin ini.",
+
+    riskWhyTitle = "Analisis Risiko & Solusi",
+    riskActivePermsLabel = "Izin sensitif aktif saat ini",
+    riskDeclaredOnlyNote = "Tidak ada izin sensitif yang sedang aktif (izin lain hanya tercantum di APK).",
+    riskTrackersLabel = "SDK tracker tertanam di APK",
+    riskFixPermsHint = "Bisa diatasi: cabut izin aktif langsung lewat tombol di bawah atau tab Izin & AppOps.",
+    riskFixTrackersHint = "SDK tracker melekat di APK (tak bisa dihapus), namun komunikasinya diblokir lewat Firewall + Private DNS.",
+    revokeAllSensPerms = "Cabut Semua Izin Sensitif Aktif",
 
     sheetNetwork = "Jaringan",
-    sheetScopes = "Isolasi Data",
+    sheetPerms = "Izin & AppOps",
     sheetFreezer = "Pembeku",
     allowWifi = "Izinkan Wi-Fi",
     allowWifiDesc = "Akses internet lewat jaringan Wi-Fi",
@@ -282,8 +403,8 @@ val StringsId = SiloStrings(
     allowCellularDesc = "Akses internet lewat data seluler (ccmni+/rmnet+)",
     allowVpn = "Izinkan VPN",
     allowVpnDesc = "Akses internet saat terowongan VPN aktif",
-    allowScreenOff = "Izinkan saat Layar Mati",
-    allowScreenOffDesc = "Matikan agar app tidak mengirim data diam-diam saat HP tidur",
+    blockScreenOff = "Blokir saat Layar Mati",
+    blockScreenOffDesc = "Putus internet aplikasi ini otomatis saat layar mati / HP tidur",
     allowLan = "Izinkan Jaringan Lokal (LAN)",
     allowLanDesc = "Pengecualian untuk Chromecast, LocalSend, atau printer lokal",
     blockHttp = "Blokir HTTP Polos (Port 80)",
@@ -298,24 +419,20 @@ val StringsId = SiloStrings(
     killTcpNow = "Putus Koneksi TCP Sekarang",
     resetNetRule = "Kembalikan ke Default",
 
-    scopesIntro = "Memalsukan izin jadi kosong (appops ignore) sehingga aplikasi tidak crash namun tidak bisa membaca data pribadi Anda.",
-    isolateAllHardened = "Isolasi Penuh (1-Klik)",
-    scopeContacts = "Palsukan Kontak Kosong",
-    scopeContactsDesc = "Aplikasi melihat 0 kontak tanpa memicu error",
-    scopeStorage = "Palsukan Penyimpanan Kosong",
-    scopeStorageDesc = "Sembunyikan galeri foto, video, dan file dari aplikasi ini",
-    scopeSmsCall = "Palsukan SMS & Log Panggilan",
-    scopeSmsCallDesc = "Cegah pembacaan SMS OTP maupun riwayat panggilan",
-    scopeClipboard = "Blokir Intip Clipboard",
-    scopeClipboardDesc = "Aplikasi tidak dapat membaca teks yang Anda salin",
-    scopeSensors = "Batasi Sensor Tubuh & Aktivitas",
-    scopeSensorsDesc = "Cabut akses sensor aktivitas fisik & pelacakan gerak",
-    scopeBackground = "Batasi Aktivitas Latar Belakang",
-    scopeBackgroundDesc = "Cegah wakelock, statistik penggunaan, & jalan di background",
-    scopeLocation = "Palsukan Lokasi Kosong",
-    scopeLocationDesc = "Blokir akses GPS/lokasi jaringan secara diam-diam",
-    scopeCamMic = "Blokir Kamera & Mikrofon",
-    scopeCamMicDesc = "Cegah perekaman kamera dan audio untuk aplikasi ini",
+    permsHonestNote = "Status dibaca real-time dari sistem & AppOps. Catatan jujur: kontrol Media hanya memblokir galeri/MediaStore — tidak menyembunyikan nama folder /sdcard (itu tugas SUSFS).",
+    permStateGranted = "AKTIF",
+    permStateForeground = "SAAT DIBUKA",
+    permStateIgnored = "PALSU KOSONG",
+    permStateDenied = "DICABUT",
+    permStateRunning = "SEDANG DIPAKAI",
+    permActionNormal = "Normal",
+    permActionFg = "Saat Dibuka",
+    permActionIgnore = "Palsukan",
+    permActionRevoke = "Cabut",
+    enforcerAutoRevoke = "Auto-Cabut saat Ditutup",
+    enforcerStrictLock = "Kunci Blokir",
+    enforcerHint = "Auto-Cabut: izin dicabut otomatis saat app ditutup/layar mati. Kunci Blokir: dipaksa blokir ulang jika berubah.",
+    lastAccessPrefix = "Akses terakhir",
 
     freezerIntro = "Bekukan aplikasi agar 0% CPU, 0% baterai, dan nol telemetri latar belakang.",
     autoFreezeEntry = "Masukkan Daftar Auto-Freeze",
@@ -328,21 +445,32 @@ val StringsId = SiloStrings(
     suspendedBadge = "SUSPEND",
 
     trafficBlocked = "Diblokir",
-    trafficLive = "Aktif",
-    trafficListen = "Port Listen",
-    ramOnlyBanner = "Log hanya di RAM (0 byte ke disk) — lenyap saat reboot",
-    autoRefresh = "Segarkan otomatis 3d",
+    trafficLive = "Koneksi",
+    trafficAccess = "Akses Izin",
+    ramOnlyBanner = "Log jaringan hanya di RAM (0 byte ke disk) — lenyap saat reboot",
+    accessTimelineBanner = "Timeline nyata dumpsys appops: siapa yang baru mengakses Mic, Kamera, Lokasi, Clipboard, Kontak",
     clearRing = "Bersihkan",
     noBlockedYet = "Belum ada paket diblokir yang tercatat di RAM.",
     noConnections = "Tidak ada koneksi aktif saat ini.",
+    noAccessEvents = "Belum ada akses izin sensitif yang tercatat baru-baru ini.",
     killSocket = "Putus",
     blockApp = "Blokir",
+    runningNowBadge = "AKTIF SEKARANG",
 
     secPrivateDns = "Private DNS (DoT) 1-Klik",
     privateDnsDesc = "Enkripsi seluruh query DNS sistem langsung via TLS",
     dnsOff = "Mati",
     dnsAuto = "Otomatis",
     dnsCustom = "Kustom",
+
+    secRadioPrivacy = "Privasi Jaringan & Radio (ala GrapheneOS)",
+    enhancedMacRand = "Randomisasi MAC Wi-Fi Diperketat",
+    enhancedMacRandDesc = "Acak alamat MAC Wi-Fi untuk mencegah pelacakan perangkat",
+    disableBgScan = "Matikan Pindai Wi-Fi & BLE Latar",
+    disableBgScanDesc = "Cegah sistem memindai lokasi lewat Wi-Fi/Bluetooth saat radio mati",
+    disableCaptivePortal = "Matikan Ping Captive Portal Google",
+    disableCaptivePortalDesc = "Cegah Android menghubungi connectivitycheck.gstatic.com tiap konek Wi-Fi",
+    adbLiveWarning = "Status ADB saat ini: AKTIF",
 
     secGlobalNet = "Proteksi Jaringan Global",
     fwModeLabel = "Mode Kebijakan Firewall",
@@ -374,6 +502,8 @@ val StringsId = SiloStrings(
     clearList = "Kosongkan",
 
     secAutomation = "Otomasi Privasi (ala GrapheneOS)",
+    usbAdbLockGuard = "Kunci USB & ADB saat Layar Terkunci",
+    usbAdbLockGuardDesc = "Otomatis matikan ADB & set USB charge-only saat terkunci (tetap mati saat unlock; aman untuk Download Mode)",
     autoRebootBfu = "Auto-Reboot ke BFU saat Terkunci",
     autoRebootBfuDesc = "Reboot otomatis ke mode terenkripsi penuh jika HP lama terkunci",
     autoClearClip = "Hapus Clipboard Otomatis",
@@ -390,17 +520,20 @@ val StringsId = SiloStrings(
 
     secKernelHardening = "Pengerasan Kernel (sysctl)",
     hardeningMaster = "Aktifkan Pengerasan Kernel",
-    hardeningMasterDesc = "Tutup unprivileged eBPF, harden JIT, anti-uptime TCP, privasi IPv6",
+    hardeningMasterDesc = "Tutup unpriv-eBPF, JIT harden, ASLR/Yama ptrace, anti-redirect/RFC1337, TCP/IPv6 privacy",
     inspectSysctl = "Lihat Nilai Kernel Aktual",
     rollbackSysctl = "Kembalikan ke Default Kernel",
     tcpCongestion = "Kontrol Kongesti TCP",
     packetScheduler = "Penjadwal Paket (qdisc)",
 
-    secVerification = "Verifikasi & Audit Keamanan",
+    secVerification = "Verifikasi & Transparansi",
     runLiveProofRow = "Uji Penegakan Nyata (Live Proof)",
-    runLiveProofDesc = "Buktikan langsung rule iptables, cgroup frozen, appops, & sysctl di kernel",
+    runLiveProofDesc = "Buktikan langsung rule iptables, cgroup frozen, appops, sensor & sysctl di kernel",
     runAuditRow = "Audit Integritas & Stealth Sentinel",
     runAuditDesc = "Periksa SELinux, CA MitM, port liar, proses root, & kebersihan stealth",
+    grapheneNotesRow = "Batasan Hardware & ROM (Tanpa Gimik)",
+    grapheneNotesDesc = "Mengapa fitur tertentu GrapheneOS sengaja tidak dipalsukan di SM-A146P",
+    grapheneNotesBody = "• Hardware MTE & PAC/BTI: CPU Dimensity 700 (ARMv8.2-A) tidak memiliki ekstensi ARMv8.5+ MTE.\n\n• hardened_malloc, Blokir DCL / Exec-Spawning: butuh kompilasi ulang Bionic libc & Zygote pada source ROM AOSP.\n\n• Storage Scopes sejati (folder /sdcard kosong per app): butuh patch OS MediaProvider FUSE; bind-mount per-app merusak stealth (mountinfo). Penyembunyian folder sensitif ditangani SUSFS di kernel.\n\n• Sandboxed Google Play, Locked AVB + Titan M2, & PIN Scrambling: terbatas oleh stock ROM One UI 7 & bootloader unlocked.",
 
     secPreferences = "Tampilan, Bahasa & Cadangan",
     languageLabel = "Bahasa",
@@ -411,6 +544,8 @@ val StringsId = SiloStrings(
     importBackup = "Impor Konfigurasi",
     emergencyFlush = "Flush Darurat Firewall",
     emergencyFlushDesc = "Cabut semua aturan SILO_* di kernel tanpa menyentuh sistem Android",
+
+    isIndonesian = true,
 )
 
 val StringsEn = SiloStrings(
@@ -421,13 +556,13 @@ val StringsEn = SiloStrings(
 
     titleHome = "Silo",
     titleApps = "App Controls",
-    titleTraffic = "Live Traffic",
+    titleTraffic = "Real-Time Monitor",
     titleSystem = "System & Security",
 
     daemonOffline = "Root Daemon Offline",
-    daemonOfflineDesc = "Install silo-ksu-module-v2.0.0.zip in KernelSU-Next, reboot, and grant root access to Silo.",
+    daemonOfflineDesc = "Install silo-ksu-module-v3.0.0.zip in KernelSU-Next, reboot, and grant root access to Silo.",
     retryBridge = "Reconnect Bridge",
-    securityScore = "Security Score",
+    securityScore = "Score",
     firewallMaster = "Kernel Firewall",
     firewallActiveHint = "Enforcing in Linux Netfilter • Zero VPN slot used",
     firewallOffHint = "Disabled • Safe-First initial mode",
@@ -435,7 +570,7 @@ val StringsEn = SiloStrings(
     bootGuardArmed = "Boot Guard: Verifying 45s",
     metricBlocked = "Blocked",
     metricFrozen = "Frozen",
-    metricIsolated = "Isolated",
+    metricEnforced = "Perm Guard",
 
     presetsTitle = "Quick Presets",
     presetsSubtitle = "One-tap security profiles. Auto-Reboot BFU always stays manual opt-in.",
@@ -446,13 +581,20 @@ val StringsEn = SiloStrings(
     presetHardened = "Hardened",
     presetHardenedDesc = "+ No HTTP, TTL 64, Auto-block new apps",
     presetLockdown = "Lockdown",
-    presetLockdownDesc = "Block all apps unless explicitly allowed",
+    presetLockdownDesc = "Default-deny + USB/ADB lock guard",
 
-    quickActions = "Quick Actions",
-    sensorsOff = "Sensors Off",
-    sensorsOffShort = "Mic & Camera",
+    quickActions = "Live Hardware Controls",
+    muteMic = "Microphone",
+    muteCamera = "Camera",
+    stateMuted = "MUTED",
+    stateLive = "Active (Live)",
     clearClipboard = "Wipe Clipboard",
     liveProof = "Live Proof",
+    panicLockdown = "Panic Lockdown",
+    panicLockdownSub = "Cut Net+Mic+Cam",
+    panicLockdownTitle = "Trigger Panic Lockdown?",
+    panicLockdownBody = "Non-destructive (keeps all your data): switches Firewall to Default-Deny, severs all active TCP sockets, mutes Mic & Camera, disables Wi-Fi & Bluetooth, and wipes Clipboard.",
+    confirmLockdown = "Lock Down Now",
     panicBfu = "Panic BFU",
     panicDialogTitle = "Emergency Reboot to BFU?",
     panicDialogBody = "Your device will cleanly reboot into Before-First-Unlock (BFU) state, purging encryption keys from RAM immediately.",
@@ -465,15 +607,31 @@ val StringsEn = SiloStrings(
     searchApps = "Search apps...",
     filterUser = "Apps",
     filterRestricted = "Restricted",
+    filterAudit = "Perm Audit",
     filterSystem = "System",
     noAppsFound = "No matching apps found.",
     riskHigh = "High Risk",
-    riskMedium = "Medium",
-    trackersFound = "tracker(s) detected",
+    riskMedium = "Medium Risk",
+    riskLow = "Low Risk",
+    trackersFound = "tracker(s)",
+    activePermsShort = "active perms",
     tempUnblockActive = "Temp access",
+    auditBanner = "Showing apps CURRENTLY GRANTED sensitive permissions (live from Android):",
+    auditAllCategories = "All",
+    revokeAllVisible = "Revoke All",
+    revokeOne = "Revoke",
+    noAppsWithPerm = "No apps currently hold this permission.",
+
+    riskWhyTitle = "Risk Breakdown & Mitigation",
+    riskActivePermsLabel = "Currently granted sensitive permissions",
+    riskDeclaredOnlyNote = "No sensitive permissions are currently granted (others are only declared in the APK).",
+    riskTrackersLabel = "Embedded tracker SDKs in APK",
+    riskFixPermsHint = "Fixable now: revoke active permissions below or inside the Permissions tab.",
+    riskFixTrackersHint = "Tracker SDK code is compiled into the APK, but its network calls are blocked via Firewall + Private DNS.",
+    revokeAllSensPerms = "Revoke All Active Sensitive Permissions",
 
     sheetNetwork = "Network",
-    sheetScopes = "Data Scopes",
+    sheetPerms = "Permissions",
     sheetFreezer = "Freezer",
     allowWifi = "Allow Wi-Fi",
     allowWifiDesc = "Permit internet traffic over Wi-Fi networks",
@@ -481,8 +639,8 @@ val StringsEn = SiloStrings(
     allowCellularDesc = "Permit mobile data traffic (ccmni+/rmnet+)",
     allowVpn = "Allow VPN",
     allowVpnDesc = "Permit traffic while a VPN tunnel is active",
-    allowScreenOff = "Allow While Screen Off",
-    allowScreenOffDesc = "Turn off to block silent background traffic while asleep",
+    blockScreenOff = "Block While Screen Off",
+    blockScreenOffDesc = "Automatically cut internet for this app whenever the screen turns off",
     allowLan = "Allow Local Network (LAN)",
     allowLanDesc = "Exemption for Chromecast, LocalSend, or local printers",
     blockHttp = "Block Cleartext HTTP (Port 80)",
@@ -497,24 +655,20 @@ val StringsEn = SiloStrings(
     killTcpNow = "Cut Active TCP Sockets",
     resetNetRule = "Reset to Default",
 
-    scopesIntro = "Fakes empty data via Android appops ignore so apps run without crashing while seeing zero personal data.",
-    isolateAllHardened = "Full Isolation (1-Tap)",
-    scopeContacts = "Fake Empty Contacts",
-    scopeContactsDesc = "App receives 0 contacts without crashing",
-    scopeStorage = "Fake Empty Storage",
-    scopeStorageDesc = "Hide photos, videos, and shared files from this app",
-    scopeSmsCall = "Fake Empty SMS & Call Log",
-    scopeSmsCallDesc = "Block reading OTP messages and call history",
-    scopeClipboard = "Block Clipboard Snooping",
-    scopeClipboardDesc = "Prevent silent reads of copied clipboard text",
-    scopeSensors = "Restrict Activity & Body Sensors",
-    scopeSensorsDesc = "Revoke physical activity and body sensor access",
-    scopeBackground = "Restrict Background & Wakelocks",
-    scopeBackgroundDesc = "Block background execution, usage stats, and wakelocks",
-    scopeLocation = "Fake Empty Location",
-    scopeLocationDesc = "Silently withhold GPS and network location data",
-    scopeCamMic = "Block Camera & Microphone",
-    scopeCamMicDesc = "Deny camera and audio capture for this app",
+    permsHonestNote = "Read live from Android PackageManager & AppOps. Honest note: Media restricts MediaStore/gallery access — it does not hide /sdcard folder names (handled by SUSFS).",
+    permStateGranted = "GRANTED",
+    permStateForeground = "FOREGROUND",
+    permStateIgnored = "FAKE EMPTY",
+    permStateDenied = "REVOKED",
+    permStateRunning = "IN USE NOW",
+    permActionNormal = "Normal",
+    permActionFg = "While Open",
+    permActionIgnore = "Fake Empty",
+    permActionRevoke = "Revoke",
+    enforcerAutoRevoke = "Auto-Revoke on Close",
+    enforcerStrictLock = "Lock Blocked",
+    enforcerHint = "Auto-Revoke: automatically revokes when backgrounded/screen off. Lock Blocked: re-enforces if changed externally.",
+    lastAccessPrefix = "Last access",
 
     freezerIntro = "Suspend background apps for 0% CPU, 0% wakelocks, and zero silent telemetry.",
     autoFreezeEntry = "Include in Auto-Freeze List",
@@ -527,21 +681,32 @@ val StringsEn = SiloStrings(
     suspendedBadge = "SUSPENDED",
 
     trafficBlocked = "Blocked",
-    trafficLive = "Active",
-    trafficListen = "Listening",
-    ramOnlyBanner = "RAM-only logs (0 bytes written to disk) — cleared on reboot",
-    autoRefresh = "Auto-refresh 3s",
+    trafficLive = "Sockets",
+    trafficAccess = "Perm Access",
+    ramOnlyBanner = "Network logs live strictly in RAM (0 bytes to disk) — cleared on reboot",
+    accessTimelineBanner = "Live dumpsys appops timeline: recent Mic, Camera, Location, Clipboard & Contacts access",
     clearRing = "Clear",
     noBlockedYet = "No blocked packets captured in RAM yet.",
     noConnections = "No active sockets right now.",
+    noAccessEvents = "No recent sensitive permission accesses recorded.",
     killSocket = "Kill",
     blockApp = "Block",
+    runningNowBadge = "ACTIVE NOW",
 
     secPrivateDns = "Private DNS (DoT) 1-Tap",
     privateDnsDesc = "Encrypt all system DNS queries natively over TLS",
     dnsOff = "Off",
     dnsAuto = "Auto",
     dnsCustom = "Custom",
+
+    secRadioPrivacy = "Network & Radio Privacy (GrapheneOS-Style)",
+    enhancedMacRand = "Enhanced Wi-Fi MAC Randomization",
+    enhancedMacRandDesc = "Randomize Wi-Fi MAC addresses to prevent cross-network tracking",
+    disableBgScan = "Disable Background Wi-Fi & BLE Scanning",
+    disableBgScanDesc = "Stop Android from scanning nearby Wi-Fi/BLE even when radios are off",
+    disableCaptivePortal = "Disable Google Captive Portal Pings",
+    disableCaptivePortalDesc = "Stop connectivitycheck.gstatic.com pings on every Wi-Fi connect",
+    adbLiveWarning = "Live ADB state: ENABLED",
 
     secGlobalNet = "Global Network Guards",
     fwModeLabel = "Firewall Policy Mode",
@@ -573,6 +738,8 @@ val StringsEn = SiloStrings(
     clearList = "Clear List",
 
     secAutomation = "Privacy Automation (GrapheneOS-Style)",
+    usbAdbLockGuard = "Lock USB & ADB on Lockscreen",
+    usbAdbLockGuardDesc = "Disables ADB & sets USB charge-only when locked (stays off on unlock; Download Mode safe)",
     autoRebootBfu = "Auto-Reboot to BFU When Locked",
     autoRebootBfuDesc = "Cleanly reboot into encrypted BFU if left locked past timeout",
     autoClearClip = "Auto-Clear Clipboard",
@@ -589,17 +756,20 @@ val StringsEn = SiloStrings(
 
     secKernelHardening = "Kernel Hardening (sysctl)",
     hardeningMaster = "Enable Kernel Hardening",
-    hardeningMasterDesc = "Reversible unpriv-BPF off, JIT harden, anti-uptime TCP, IPv6 privacy",
+    hardeningMasterDesc = "Reversible unpriv-BPF off, JIT harden, ASLR/Yama ptrace, anti-redirect/RFC1337, TCP/IPv6 privacy",
     inspectSysctl = "Inspect Live Kernel Values",
     rollbackSysctl = "Rollback to Kernel Defaults",
     tcpCongestion = "TCP Congestion Control",
     packetScheduler = "Packet Scheduler (qdisc)",
 
-    secVerification = "Verification & Security Audit",
+    secVerification = "Verification & Transparency",
     runLiveProofRow = "Run Live Enforcement Proof",
-    runLiveProofDesc = "Directly inspect live iptables chains, cgroups, appops & sysctl",
+    runLiveProofDesc = "Directly inspect live iptables chains, cgroups, appops, sensors & sysctl",
     runAuditRow = "Stealth & Integrity Sentinel Audit",
     runAuditDesc = "Verify SELinux, MitM CAs, rogue listeners, root procs & stealth",
+    grapheneNotesRow = "Hardware & ROM Boundaries (No Gimmicks)",
+    grapheneNotesDesc = "Why certain GrapheneOS features are intentionally omitted on SM-A146P",
+    grapheneNotesBody = "• Hardware MTE & PAC/BTI: Dimensity 700 (ARMv8.2-A) lacks ARMv8.5+ hardware MTE.\n\n• hardened_malloc, DCL / Exec-Spawning block: requires rebuilding Bionic libc & Zygote inside AOSP ROM source.\n\n• True Storage Scopes (per-app empty /sdcard): requires OS MediaProvider FUSE patches; per-app bind-mounts expose mountinfo to detectors. Path hiding belongs to kernel SUSFS.\n\n• Sandboxed Google Play, Locked AVB + Titan M2, & Lockscreen PIN Scrambling: constrained by stock One UI 7 ROM & unlocked bootloader.",
 
     secPreferences = "Appearance, Language & Backup",
     languageLabel = "Language",
@@ -610,6 +780,8 @@ val StringsEn = SiloStrings(
     importBackup = "Import Config JSON",
     emergencyFlush = "Emergency Flush Firewall",
     emergencyFlushDesc = "Detach all SILO_* kernel chains without touching Android netd",
+
+    isIndonesian = false,
 )
 
 fun resolveStrings(pref: AppLanguagePref): SiloStrings {

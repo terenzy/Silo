@@ -359,14 +359,15 @@ pub fn run_live_proof(
         ),
     });
 
-    // 5. Live App Isolation Scopes Proof (`cmd appops get`)
+    // 5. Live Permission & AppOps Enforcer Proof (`cmd appops get`)
     let live_ignored_ops = count_live_ignored_ops(&cfg.scopes);
+    let guarded_apps = cfg.scopes.guards.len();
     items.push(LiveProofItem {
-        subsystem: "App Isolation Scopes (AppOps ignore)".into(),
-        verified: cfg.scopes.apps.is_empty() || live_ignored_ops > 0,
+        subsystem: "Permission & AppOps Enforcer".into(),
+        verified: (cfg.scopes.apps.is_empty() && guarded_apps == 0) || live_ignored_ops > 0,
         evidence: format!(
-            "{} isolated app(s), {} live `ignore` AppOps verified in framework",
-            cfg.scopes.apps.len(),
+            "{} guarded app(s), {} live `ignore` AppOps verified in framework",
+            guarded_apps.max(cfg.scopes.apps.len()),
             live_ignored_ops
         ),
     });
@@ -396,6 +397,22 @@ pub fn run_live_proof(
             } else {
                 &dns.specifier
             }
+        ),
+    });
+
+    // 8. Live Hardware Sensor Privacy & Radio/ADB Proof
+    let sp = crate::automation::probe_real_sensor_privacy();
+    let rp = crate::automation::get_radio_privacy();
+    items.push(LiveProofItem {
+        subsystem: "Hardware Sensors & Radio/ADB State".into(),
+        verified: !rp.adb_enabled_live || !cfg.automation.usb_adb_lock_guard,
+        evidence: format!(
+            "mic_muted={}, cam_muted={}, mac_rand={}, scan_off={}, adb_live={}",
+            sp.mic_muted,
+            sp.camera_muted,
+            rp.enhanced_mac_randomization,
+            rp.disable_wifi_ble_scanning,
+            rp.adb_enabled_live
         ),
     });
 
@@ -496,6 +513,6 @@ mod tests {
 
         let caps = crate::firewall::probe_capabilities();
         let proof = run_live_proof(&cfg, &caps, &HardeningEngine::new(), &FreezerEngine::new());
-        assert_eq!(proof.items.len(), 7);
+        assert_eq!(proof.items.len(), 8);
     }
 }

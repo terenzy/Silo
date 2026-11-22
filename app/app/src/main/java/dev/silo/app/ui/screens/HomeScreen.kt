@@ -32,12 +32,34 @@ fun HomeScreen(
     vm: SiloViewModel,
 ) {
     val s = LocalSiloStrings.current
-    var showPanicDialog by remember { mutableStateOf(false) }
+    var showPanicRebootDialog by remember { mutableStateOf(false) }
+    var showPanicLockdownDialog by remember { mutableStateOf(false) }
     var showProofSheet by remember { mutableStateOf(false) }
 
-    if (showPanicDialog) {
+    if (showPanicLockdownDialog) {
         AlertDialog(
-            onDismissRequest = { showPanicDialog = false },
+            onDismissRequest = { showPanicLockdownDialog = false },
+            icon = { Icon(Icons.Rounded.GppBad, contentDescription = null, tint = SiloAmber) },
+            title = { Text(s.panicLockdownTitle) },
+            text = { Text(s.panicLockdownBody) },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = SiloAmber, contentColor = Color.Black),
+                    onClick = {
+                        showPanicLockdownDialog = false
+                        vm.triggerPanicLockdown()
+                    }
+                ) { Text(s.confirmLockdown) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPanicLockdownDialog = false }) { Text(s.cancel) }
+            },
+        )
+    }
+
+    if (showPanicRebootDialog) {
+        AlertDialog(
+            onDismissRequest = { showPanicRebootDialog = false },
             icon = { Icon(Icons.Rounded.PowerSettingsNew, contentDescription = null, tint = SiloCrimson) },
             title = { Text(s.panicDialogTitle) },
             text = { Text(s.panicDialogBody) },
@@ -45,13 +67,13 @@ fun HomeScreen(
                 Button(
                     colors = ButtonDefaults.buttonColors(containerColor = SiloCrimson),
                     onClick = {
-                        showPanicDialog = false
+                        showPanicRebootDialog = false
                         vm.triggerPanicReboot()
                     }
                 ) { Text(s.confirmReboot) }
             },
             dismissButton = {
-                TextButton(onClick = { showPanicDialog = false }) { Text(s.cancel) }
+                TextButton(onClick = { showPanicRebootDialog = false }) { Text(s.cancel) }
             },
         )
     }
@@ -161,8 +183,8 @@ fun HomeScreen(
                         )
                         StatTile(
                             modifier = Modifier.weight(1f),
-                            value = "${state.config.scopes.apps.size}",
-                            label = s.metricIsolated,
+                            value = "${state.status.enforcerRulesCount}",
+                            label = s.metricEnforced,
                             accent = SiloAmber,
                         )
                     }
@@ -174,14 +196,19 @@ fun HomeScreen(
                         else -> s.dnsAuto
                     }
                     val bootText = if (state.status.bootGuardCleared) s.bootGuardOk else s.bootGuardArmed
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
+                    Text(
+                        "$bootText  •  DNS: $dnsLabel",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+
+                    state.status.lastEnforcerEvent?.let { ev ->
                         Text(
-                            "$bootText  •  DNS: $dnsLabel",
+                            ev,
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = SiloEmerald,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -198,20 +225,33 @@ fun HomeScreen(
             }
         }
 
-        // Quick Actions 2x2 Borderless Grid
+        // Live Hardware Controls (separated real-time Mic & Camera + Panic Lockdown + Live Proof)
         item {
             SiloSectionLabel(s.quickActions)
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Row 1: Separated LIVE Mic & Camera toggles backed by dumpsys sensor_privacy
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
-                        icon = if (state.status.sensorsOffActive) Icons.Rounded.MicOff else Icons.Rounded.Mic,
-                        title = s.sensorsOff,
-                        subtitle = s.sensorsOffShort,
-                        active = state.status.sensorsOffActive,
+                        icon = if (state.status.micMuted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
+                        title = s.muteMic,
+                        subtitle = if (state.status.micMuted) s.stateMuted else s.stateLive,
+                        active = state.status.micMuted,
                         accent = SiloAmber,
-                        onClick = { vm.setSensorsOff(!state.status.sensorsOffActive) },
+                        onClick = { vm.setSensorPrivacy("microphone", !state.status.micMuted) },
                     )
+                    QuickActionTile(
+                        modifier = Modifier.weight(1f),
+                        icon = if (state.status.cameraMuted) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
+                        title = s.muteCamera,
+                        subtitle = if (state.status.cameraMuted) s.stateMuted else s.stateLive,
+                        active = state.status.cameraMuted,
+                        accent = SiloAmber,
+                        onClick = { vm.setSensorPrivacy("camera", !state.status.cameraMuted) },
+                    )
+                }
+                // Row 2: Wipe Clipboard & Live Kernel Proof
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
                         icon = Icons.Rounded.ContentPasteOff,
@@ -221,19 +261,31 @@ fun HomeScreen(
                         accent = SiloCyan,
                         onClick = { vm.clearClipboardNow() },
                     )
-                }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
                         icon = Icons.Rounded.Verified,
                         title = s.liveProof,
-                        subtitle = "iptables • cgroup",
+                        subtitle = "iptables • appops",
                         active = state.liveProof?.ipv4HookAttached == true,
                         accent = SiloEmerald,
                         onClick = {
                             vm.runLiveProof { showProofSheet = true }
                             showProofSheet = true
                         },
+                    )
+                }
+                // Row 3: Panic Lockdown (Non-Destructive) & Emergency Reboot BFU
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    QuickActionTile(
+                        modifier = Modifier.weight(1f),
+                        icon = Icons.Rounded.GppBad,
+                        title = s.panicLockdown,
+                        subtitle = s.panicLockdownSub,
+                        active = state.config.firewall.enabled &&
+                            state.config.firewall.mode == FirewallMode.DEFAULT_DENY &&
+                            state.status.micMuted && state.status.cameraMuted,
+                        accent = SiloCrimson,
+                        onClick = { showPanicLockdownDialog = true },
                     )
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
@@ -242,66 +294,73 @@ fun HomeScreen(
                         subtitle = "BFU Lock",
                         active = false,
                         accent = SiloCrimson,
-                        onClick = { showPanicDialog = true },
+                        onClick = { showPanicRebootDialog = true },
                     )
                 }
             }
         }
 
-        // Clean Flat Presets List
+        // Quick Presets (Borderless grouped list)
         item {
             SiloSectionLabel(s.presetsTitle)
-            Text(
-                s.presetsSubtitle,
-                modifier = Modifier.padding(start = 6.dp, bottom = 8.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
             SiloGroup {
-                val activePreset = detectActivePreset(state)
-                PresetRow(s.presetSafe, s.presetSafeDesc, activePreset == SecurityPreset.SAFE) {
+                val fw = state.config.firewall
+                val isSafe = !fw.enabled && !state.config.hardening.enabled
+                val isLockdown = fw.enabled && fw.mode == FirewallMode.DEFAULT_DENY
+                val isHardened = fw.enabled && !isLockdown && fw.blockCleartextHttpGlobal
+                val isBalanced = fw.enabled && !isLockdown && !isHardened
+
+                PresetRow(s.presetSafe, s.presetSafeDesc, isSafe, SiloCyan) {
                     vm.applyPreset(SecurityPreset.SAFE)
                 }
                 SiloHairline()
-                PresetRow(s.presetBalanced, s.presetBalancedDesc, activePreset == SecurityPreset.BALANCED) {
+                PresetRow(s.presetBalanced, s.presetBalancedDesc, isBalanced, SiloEmerald) {
                     vm.applyPreset(SecurityPreset.BALANCED)
                 }
                 SiloHairline()
-                PresetRow(s.presetHardened, s.presetHardenedDesc, activePreset == SecurityPreset.HARDENED) {
+                PresetRow(s.presetHardened, s.presetHardenedDesc, isHardened, SiloAmber) {
                     vm.applyPreset(SecurityPreset.HARDENED)
                 }
                 SiloHairline()
-                PresetRow(s.presetLockdown, s.presetLockdownDesc, activePreset == SecurityPreset.PARANOID) {
+                PresetRow(s.presetLockdown, s.presetLockdownDesc, isLockdown, SiloCrimson) {
                     vm.applyPreset(SecurityPreset.PARANOID)
                 }
             }
+            Text(
+                s.presetsSubtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            )
         }
-    }
-}
 
-private fun detectActivePreset(state: SiloUiState): SecurityPreset? {
-    val fw = state.config.firewall
-    return when {
-        !fw.enabled && !state.config.hardening.enabled -> SecurityPreset.SAFE
-        fw.enabled && fw.mode == FirewallMode.DEFAULT_DENY -> SecurityPreset.PARANOID
-        fw.enabled && fw.blockCleartextHttpGlobal && fw.normalizeTtlHl -> SecurityPreset.HARDENED
-        fw.enabled && fw.isolateLan && fw.dnsLeakGuard -> SecurityPreset.BALANCED
-        else -> null
+        item { Spacer(Modifier.height(12.dp)) }
     }
 }
 
 @Composable
-private fun StatTile(modifier: Modifier, value: String, label: String, accent: Color) {
+private fun StatTile(
+    modifier: Modifier,
+    value: String,
+    label: String,
+    accent: Color,
+) {
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
     ) {
         Column(
-            modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp),
+            modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = accent)
+            Text(
+                value,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = accent,
+                maxLines = 1,
+            )
             Text(
                 label,
                 style = MaterialTheme.typography.labelSmall,
@@ -323,53 +382,85 @@ private fun QuickActionTile(
     accent: Color,
     onClick: () -> Unit,
 ) {
-    val bg = if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface
+    val bg = if (active) accent.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface
     Surface(
         modifier = modifier
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(18.dp))
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(18.dp),
         color = bg,
     ) {
         Row(
-            modifier = Modifier.padding(14.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Surface(shape = CircleShape, color = accent.copy(alpha = 0.16f), modifier = Modifier.size(36.dp)) {
+            Surface(
+                modifier = Modifier.size(36.dp),
+                shape = CircleShape,
+                color = accent.copy(alpha = if (active) 0.28f else 0.14f),
+            ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
+                    Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(19.dp))
                 }
             }
             Column(Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun PresetRow(title: String, desc: String, selected: Boolean, onClick: () -> Unit) {
+private fun PresetRow(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+        Surface(
+            modifier = Modifier.size(10.dp),
+            shape = CircleShape,
+            color = if (selected) accent else MaterialTheme.colorScheme.surfaceVariant,
+        ) {}
+        Column(Modifier.weight(1f)) {
             Text(
                 title,
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                color = if (selected) accent else MaterialTheme.colorScheme.onSurface,
             )
-            Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         if (selected) {
-            Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+            Icon(Icons.Rounded.Check, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
         }
     }
 }
@@ -385,36 +476,53 @@ fun LiveProofSheetContent(
             .fillMaxWidth()
             .padding(horizontal = 20.dp)
             .padding(bottom = 28.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(s.runLiveProofRow, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             IconButton(onClick = onRefresh) {
                 Icon(Icons.Rounded.Refresh, contentDescription = null)
             }
         }
+
         if (proof == null) {
-            Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(modifier = Modifier.size(28.dp))
+            Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(strokeWidth = 2.dp)
             }
         } else {
-            proof.items.forEach { item ->
-                val tint = if (item.verified) SiloEmerald else SiloAmber
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Icon(
-                        if (item.verified) Icons.Rounded.CheckCircle else Icons.Rounded.Info,
-                        contentDescription = null,
-                        tint = tint,
-                        modifier = Modifier.size(18.dp).padding(top = 2.dp),
-                    )
-                    Column(Modifier.weight(1f)) {
-                        Text(item.subsystem, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                        Text(item.evidence, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)) {
+                proof.items.forEachIndexed { idx, item ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            if (item.verified) Icons.Rounded.CheckCircle else Icons.Rounded.WarningAmber,
+                            contentDescription = null,
+                            tint = if (item.verified) SiloEmerald else SiloAmber,
+                            modifier = Modifier.size(19.dp),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                item.subsystem,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                item.evidence,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
+                    if (idx < proof.items.lastIndex) SiloHairline()
                 }
             }
         }

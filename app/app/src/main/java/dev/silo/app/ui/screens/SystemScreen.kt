@@ -35,11 +35,13 @@ fun SystemScreen(
     val fw = state.config.firewall
     val auto = state.config.automation
     val h = state.config.hardening
+    val rp = state.status.radioPrivacy
 
     var showBlocklistSheet by remember { mutableStateOf(false) }
     var showSysctlSheet by remember { mutableStateOf(false) }
     var showProofSheet by remember { mutableStateOf(false) }
     var showAuditSheet by remember { mutableStateOf(false) }
+    var showGrapheneSheet by remember { mutableStateOf(false) }
     var showCustomDnsDialog by remember { mutableStateOf(false) }
     var customDnsHost by remember { mutableStateOf(state.status.privateDns.specifier) }
     var cidrInput by remember { mutableStateOf("") }
@@ -78,6 +80,29 @@ fun SystemScreen(
                 TextButton(onClick = { showCustomDnsDialog = false }) { Text(s.cancel) }
             },
         )
+    }
+
+    if (showGrapheneSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showGrapheneSheet = false },
+            containerColor = MaterialTheme.colorScheme.surface,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 28.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(s.grapheneNotesRow, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    s.grapheneNotesBody,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 
     if (showBlocklistSheet) {
@@ -232,7 +257,36 @@ fun SystemScreen(
             }
         }
 
-        // 2. Global Network Guards
+        // 2. Network & Radio Privacy (GrapheneOS-style, live from Android Settings Global)
+        item {
+            SiloSectionLabel(s.secRadioPrivacy)
+            SiloGroup {
+                SiloSwitchRow(s.enhancedMacRand, s.enhancedMacRandDesc, rp.enhancedMacRandomization) { on ->
+                    vm.setRadioPrivacy(enhancedMacRandomization = on)
+                }
+                SiloHairline()
+                SiloSwitchRow(s.disableBgScan, s.disableBgScanDesc, rp.disableWifiBleScanning) { on ->
+                    vm.setRadioPrivacy(disableWifiBleScanning = on)
+                }
+                SiloHairline()
+                SiloSwitchRow(s.disableCaptivePortal, s.disableCaptivePortalDesc, rp.disableCaptivePortal) { on ->
+                    vm.setRadioPrivacy(disableCaptivePortal = on)
+                }
+                if (rp.adbEnabledLive) {
+                    SiloHairline()
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Rounded.Usb, contentDescription = null, tint = SiloAmber, modifier = Modifier.size(16.dp))
+                        Text(s.adbLiveWarning, style = MaterialTheme.typography.labelSmall, color = SiloAmber)
+                    }
+                }
+            }
+        }
+
+        // 3. Global Network Guards
         item {
             SiloSectionLabel(s.secGlobalNet)
             SiloGroup {
@@ -299,10 +353,14 @@ fun SystemScreen(
             }
         }
 
-        // 3. Privacy Automation (GrapheneOS-style)
+        // 4. Privacy Automation (GrapheneOS-style)
         item {
             SiloSectionLabel(s.secAutomation)
             SiloGroup {
+                SiloSwitchRow(s.usbAdbLockGuard, s.usbAdbLockGuardDesc, auto.usbAdbLockGuard) { on ->
+                    vm.updateAutomationConfig { it.copy(usbAdbLockGuard = on) }
+                }
+                SiloHairline()
                 SiloSwitchRow(
                     "${s.autoRebootBfu} (${auto.autoRebootMinutes / 60}h)",
                     s.autoRebootBfuDesc,
@@ -359,7 +417,7 @@ fun SystemScreen(
             }
         }
 
-        // 4. Kernel Hardening (sysctl) + BBRv3 / CAKE
+        // 5. Kernel Hardening (sysctl) + BBRv3 / CAKE
         item {
             SiloSectionLabel(s.secKernelHardening)
             SiloGroup {
@@ -387,7 +445,7 @@ fun SystemScreen(
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(s.packetScheduler, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for ((lbl, q) in listOf("Default" to "", "CAKE" to "cake", "FQ" to "fq", "CoDel" to "fq_codel")) {
+                        for ((lbl, q) in listOf("Default" to "", "CAKE" to "cake", "FQ" to "fq", "PIE" to "pie")) {
                             DnsPill(lbl, h.defaultQdisc == q, Modifier.weight(1f)) {
                                 vm.updateHardeningConfig { it.copy(enabled = true, defaultQdisc = q) }
                             }
@@ -398,7 +456,7 @@ fun SystemScreen(
                 SiloActionRow(
                     title = s.inspectSysctl,
                     icon = Icons.Rounded.Memory,
-                    iconTint = SiloCyan,
+                    trailingText = "${state.hardeningStatus.items.count { it.enforced }}/${state.hardeningStatus.items.count { it.supported }}",
                     onClick = { showSysctlSheet = true },
                 )
                 SiloHairline()
@@ -411,7 +469,7 @@ fun SystemScreen(
             }
         }
 
-        // 5. Verification & Security Audit
+        // 6. Verification, Audit & GrapheneOS Hardware Transparency
         item {
             SiloSectionLabel(s.secVerification)
             SiloGroup {
@@ -421,7 +479,7 @@ fun SystemScreen(
                     icon = Icons.Rounded.Verified,
                     iconTint = SiloEmerald,
                     onClick = {
-                        vm.runLiveProof()
+                        vm.runLiveProof { showProofSheet = true }
                         showProofSheet = true
                     },
                 )
@@ -437,14 +495,22 @@ fun SystemScreen(
                         showAuditSheet = true
                     },
                 )
+                SiloHairline()
+                SiloActionRow(
+                    title = s.grapheneNotesRow,
+                    subtitle = s.grapheneNotesDesc,
+                    icon = Icons.Rounded.Info,
+                    iconTint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    onClick = { showGrapheneSheet = true },
+                )
             }
         }
 
-        // 6. Language, Theme, Stealth Disguise, Backup & Recovery
+        // 7. Appearance, Language, Disguise, Backup & Emergency Flush
         item {
             SiloSectionLabel(s.secPreferences)
             SiloGroup {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(s.languageLabel, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     SiloSegmentBar(
                         options = listOf(
@@ -467,30 +533,39 @@ fun SystemScreen(
                     )
                 }
                 SiloHairline()
-                SiloSwitchRow(s.disguiseMode, s.disguiseModeDesc, state.disguiseEnabled) {
-                    vm.setDisguiseEnabled(it)
+                SiloSwitchRow(s.disguiseMode, s.disguiseModeDesc, state.disguiseEnabled) { on ->
+                    vm.setDisguiseEnabled(on)
                 }
                 SiloHairline()
                 SiloActionRow(
                     title = s.exportBackup,
-                    icon = Icons.Rounded.FileDownload,
-                    onClick = { exportBackupLauncher.launch("silo-v2-backup.json") },
+                    icon = Icons.Rounded.UploadFile,
+                    onClick = { exportBackupLauncher.launch("silo-backup.json") },
                 )
                 SiloHairline()
                 SiloActionRow(
                     title = s.importBackup,
-                    icon = Icons.Rounded.FileUpload,
+                    icon = Icons.Rounded.Download,
                     onClick = { importBackupLauncher.launch(arrayOf("application/json", "*/*")) },
                 )
                 SiloHairline()
                 SiloActionRow(
                     title = s.emergencyFlush,
                     subtitle = s.emergencyFlushDesc,
-                    icon = Icons.Rounded.DeleteSweep,
+                    icon = Icons.Rounded.WarningAmber,
                     iconTint = SiloCrimson,
                     onClick = { vm.emergencyFlushFirewall() },
                 )
             }
+        }
+
+        item {
+            Text(
+                "Silo v3.0.0  •  Daemon v${state.status.version}  •  Kernel ${state.status.capabilities.kernelRelease}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            )
         }
     }
 }
@@ -498,25 +573,25 @@ fun SystemScreen(
 @Composable
 private fun DnsPill(
     label: String,
-    selected: Boolean,
+    active: Boolean,
     modifier: Modifier,
     onClick: () -> Unit,
 ) {
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(10.dp),
-        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
         onClick = onClick,
     ) {
         Box(
-            modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
+            modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(
                 label,
                 style = MaterialTheme.typography.labelMedium,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
                 maxLines = 1,
             )
         }
@@ -539,7 +614,7 @@ private fun SentinelAuditSheetContent(
     ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "${s.runAuditRow} ${report?.let { "(${it.score}/100)" } ?: ""}",
+                "${s.runAuditRow} (${report?.score ?: 0}/100)",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -547,30 +622,22 @@ private fun SentinelAuditSheetContent(
                 Icon(Icons.Rounded.Refresh, contentDescription = null)
             }
         }
-        if (report == null) {
-            Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(modifier = Modifier.size(28.dp))
+
+        report?.findings?.forEach { f ->
+            val accent = when (f.severity) {
+                AuditSeverity.PASS -> SiloEmerald
+                AuditSeverity.INFO -> SiloCyan
+                AuditSeverity.WARN -> SiloAmber
+                AuditSeverity.CRITICAL -> SiloCrimson
             }
-        } else {
-            report.findings.forEach { f ->
-                val color = when (f.severity) {
-                    AuditSeverity.PASS -> SiloEmerald
-                    AuditSeverity.INFO -> SiloCyan
-                    AuditSeverity.WARN -> SiloAmber
-                    AuditSeverity.CRITICAL -> SiloCrimson
+            Column(Modifier.padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(f.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = accent)
+                Text(f.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                f.recommendation?.let { rec ->
+                    Text(rec, style = MaterialTheme.typography.labelSmall, color = SiloAmber)
                 }
-                Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(f.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                        Text(f.severity.name, style = MaterialTheme.typography.labelSmall, color = color, fontWeight = FontWeight.Bold)
-                    }
-                    Text(f.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    f.recommendation?.let { rec ->
-                        Text(rec, style = MaterialTheme.typography.labelSmall, color = color)
-                    }
-                }
-                SiloHairline()
             }
+            SiloHairline()
         }
     }
 }

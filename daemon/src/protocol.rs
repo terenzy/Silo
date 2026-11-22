@@ -1,6 +1,6 @@
 use crate::config::{
-    AppFirewallRule, AppIsolationScope, AutomationConfig, FirewallConfig, FreezerEntry,
-    HardeningConfig, SecurityPreset,
+    AppFirewallRule, AppIsolationScope, AppPermGuard, AutomationConfig, FirewallConfig,
+    FreezerEntry, HardeningConfig, SecurityPreset,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -95,6 +95,25 @@ pub enum DaemonCommand {
     ClearAppScope {
         package_name: String,
     },
+    InspectAppPermissions {
+        package_name: String,
+    },
+    SetAppPermissionAction {
+        package_name: String,
+        category: String,
+        action: String,
+    },
+    SetAppPermGuard {
+        package_name: String,
+        guard: AppPermGuard,
+    },
+    BulkRevokeCategory {
+        category: String,
+        packages: Vec<String>,
+    },
+    GetPrivacyAccessLog {
+        limit: Option<usize>,
+    },
     SetAutoClearClipboard {
         enabled: bool,
         clear_secs: u32,
@@ -111,11 +130,22 @@ pub enum DaemonCommand {
     SetSensorsOff {
         enabled: bool,
     },
+    SetSensorPrivacy {
+        sensor: String,
+        enabled: bool,
+    },
     GetPrivateDns,
     SetPrivateDns {
         mode: String,
         specifier: String,
     },
+    GetRadioPrivacy,
+    SetRadioPrivacy {
+        enhanced_mac_randomization: Option<bool>,
+        disable_wifi_ble_scanning: Option<bool>,
+        disable_captive_portal: Option<bool>,
+    },
+    TriggerPanicLockdown,
     TriggerPanicReboot {
         confirm_token: String,
     },
@@ -162,7 +192,7 @@ struct KillConnParams {
     remote_port: u16,
 }
 #[derive(Deserialize)]
-struct TelemetryParams {
+struct LimitParams {
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -186,6 +216,22 @@ struct PkgParams {
     package_name: String,
 }
 #[derive(Deserialize)]
+struct PermActionParams {
+    package_name: String,
+    category: String,
+    action: String,
+}
+#[derive(Deserialize)]
+struct PermGuardParams {
+    package_name: String,
+    guard: AppPermGuard,
+}
+#[derive(Deserialize)]
+struct BulkRevokeParams {
+    category: String,
+    packages: Vec<String>,
+}
+#[derive(Deserialize)]
 struct ClipParams {
     enabled: bool,
     clear_secs: u32,
@@ -203,10 +249,24 @@ struct EnabledParams {
     enabled: bool,
 }
 #[derive(Deserialize)]
+struct SensorPrivacyParams {
+    sensor: String,
+    enabled: bool,
+}
+#[derive(Deserialize)]
 struct PrivateDnsParams {
     mode: String,
     #[serde(default)]
     specifier: String,
+}
+#[derive(Deserialize)]
+struct RadioPrivacyParams {
+    #[serde(default)]
+    enhanced_mac_randomization: Option<bool>,
+    #[serde(default)]
+    disable_wifi_ble_scanning: Option<bool>,
+    #[serde(default)]
+    disable_captive_portal: Option<bool>,
 }
 #[derive(Deserialize)]
 struct PanicParams {
@@ -285,7 +345,7 @@ pub fn parse_ipc_request(line: &str) -> Result<IpcRequest, (u64, String)> {
             let limit = if p.is_null() {
                 None
             } else {
-                serde_json::from_value::<TelemetryParams>(p)
+                serde_json::from_value::<LimitParams>(p)
                     .map_err(|e| (id, e.to_string()))?
                     .limit
             };
@@ -341,6 +401,47 @@ pub fn parse_ipc_request(line: &str) -> Result<IpcRequest, (u64, String)> {
                 package_name: v.package_name,
             }
         }
+        "inspect_app_permissions" => {
+            let v: PkgParams = serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::InspectAppPermissions {
+                package_name: v.package_name,
+            }
+        }
+        "set_app_permission_action" => {
+            let v: PermActionParams =
+                serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::SetAppPermissionAction {
+                package_name: v.package_name,
+                category: v.category,
+                action: v.action,
+            }
+        }
+        "set_app_perm_guard" => {
+            let v: PermGuardParams =
+                serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::SetAppPermGuard {
+                package_name: v.package_name,
+                guard: v.guard,
+            }
+        }
+        "bulk_revoke_category" => {
+            let v: BulkRevokeParams =
+                serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::BulkRevokeCategory {
+                category: v.category,
+                packages: v.packages,
+            }
+        }
+        "get_privacy_access_log" => {
+            let limit = if p.is_null() {
+                None
+            } else {
+                serde_json::from_value::<LimitParams>(p)
+                    .map_err(|e| (id, e.to_string()))?
+                    .limit
+            };
+            DaemonCommand::GetPrivacyAccessLog { limit }
+        }
         "set_auto_clear_clipboard" => {
             let v: ClipParams = serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
             DaemonCommand::SetAutoClearClipboard {
@@ -365,6 +466,14 @@ pub fn parse_ipc_request(line: &str) -> Result<IpcRequest, (u64, String)> {
             let v: EnabledParams = serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
             DaemonCommand::SetSensorsOff { enabled: v.enabled }
         }
+        "set_sensor_privacy" => {
+            let v: SensorPrivacyParams =
+                serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::SetSensorPrivacy {
+                sensor: v.sensor,
+                enabled: v.enabled,
+            }
+        }
         "get_private_dns" => DaemonCommand::GetPrivateDns,
         "set_private_dns" => {
             let v: PrivateDnsParams =
@@ -374,6 +483,17 @@ pub fn parse_ipc_request(line: &str) -> Result<IpcRequest, (u64, String)> {
                 specifier: v.specifier,
             }
         }
+        "get_radio_privacy" => DaemonCommand::GetRadioPrivacy,
+        "set_radio_privacy" => {
+            let v: RadioPrivacyParams =
+                serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
+            DaemonCommand::SetRadioPrivacy {
+                enhanced_mac_randomization: v.enhanced_mac_randomization,
+                disable_wifi_ble_scanning: v.disable_wifi_ble_scanning,
+                disable_captive_portal: v.disable_captive_portal,
+            }
+        }
+        "trigger_panic_lockdown" => DaemonCommand::TriggerPanicLockdown,
         "trigger_panic_reboot" => {
             let v: PanicParams = serde_json::from_value(p).map_err(|e| (id, e.to_string()))?;
             DaemonCommand::TriggerPanicReboot {
@@ -465,6 +585,57 @@ pub struct PrivateDnsState {
     pub specifier: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SensorPrivacyState {
+    pub mic_muted: bool,
+    pub camera_muted: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RadioPrivacyState {
+    pub enhanced_mac_randomization: bool,
+    pub disable_wifi_ble_scanning: bool,
+    pub disable_captive_portal: bool,
+    pub adb_enabled_live: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryPermLiveState {
+    pub category: String,
+    pub appops_mode: String,
+    pub last_access: Option<String>,
+    pub running_now: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppLivePermissions {
+    pub package_name: String,
+    pub categories: Vec<CategoryPermLiveState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyAccessEvent {
+    pub uid: u32,
+    pub package_name: String,
+    pub category: String,
+    pub op: String,
+    pub mode: String,
+    pub last_access_label: String,
+    pub age_secs: u64,
+    pub running_now: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanicLockdownReport {
+    pub firewall_locked: bool,
+    pub sockets_destroyed: usize,
+    pub mic_muted: bool,
+    pub camera_muted: bool,
+    pub wifi_disabled: bool,
+    pub bluetooth_disabled: bool,
+    pub clipboard_cleared: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub version: String,
@@ -482,11 +653,17 @@ pub struct DaemonStatus {
     pub device_locked: bool,
     pub ce_unlocked: bool,
     pub sensors_off_active: bool,
+    pub mic_muted: bool,
+    pub camera_muted: bool,
     pub frozen_uids_count: usize,
     pub suspended_pkgs_count: usize,
     pub blocked_events_total: u64,
     pub auto_reboot_remaining_secs: Option<u64>,
     pub private_dns: PrivateDnsState,
+    pub radio_privacy: RadioPrivacyState,
+    pub enforcer_rules_count: usize,
+    pub enforcer_actions_count: u64,
+    pub last_enforcer_event: Option<String>,
     /// Active temporary unblock timers (UID -> remaining seconds).
     pub temp_unblocks_remaining: BTreeMap<u32, u64>,
     pub capabilities: KernelCapabilities,
@@ -614,7 +791,6 @@ mod tests {
 
     #[test]
     fn parses_set_firewall_config_with_string_uid_keys_without_error() {
-        // Exact JSON payload sent by Kotlin SiloClient.kt that previously failed in v1.0.0!
         let payload = r#"{
             "id": 15,
             "cmd": "set_firewall_config",
@@ -657,14 +833,74 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_new_v2_commands() {
-        let r1 = parse_ipc_request(r#"{"id":1,"cmd":"set_temp_unblock","params":{"uid":10277,"duration_minutes":15}}"#).unwrap();
-        assert!(matches!(r1.command, DaemonCommand::SetTempUnblock { uid: 10277, duration_minutes: 15 }));
+    fn parses_all_v2_and_v3_commands() {
+        let r1 = parse_ipc_request(
+            r#"{"id":1,"cmd":"set_temp_unblock","params":{"uid":10277,"duration_minutes":15}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r1.command,
+            DaemonCommand::SetTempUnblock {
+                uid: 10277,
+                duration_minutes: 15
+            }
+        ));
 
-        let r2 = parse_ipc_request(r#"{"id":2,"cmd":"set_private_dns","params":{"mode":"hostname","specifier":"dns.quad9.net"}}"#).unwrap();
+        let r2 = parse_ipc_request(
+            r#"{"id":2,"cmd":"set_private_dns","params":{"mode":"hostname","specifier":"dns.quad9.net"}}"#,
+        )
+        .unwrap();
         assert!(matches!(r2.command, DaemonCommand::SetPrivateDns { .. }));
 
         let r3 = parse_ipc_request(r#"{"id":3,"cmd":"run_live_proof"}"#).unwrap();
         assert!(matches!(r3.command, DaemonCommand::RunLiveProof));
+
+        let r4 = parse_ipc_request(
+            r#"{"id":4,"cmd":"set_sensor_privacy","params":{"sensor":"microphone","enabled":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(r4.command, DaemonCommand::SetSensorPrivacy { .. }));
+
+        let r5 = parse_ipc_request(
+            r#"{"id":5,"cmd":"set_app_permission_action","params":{"package_name":"com.example.app","category":"camera","action":"revoke"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r5.command,
+            DaemonCommand::SetAppPermissionAction { .. }
+        ));
+
+        let r6 = parse_ipc_request(
+            r#"{"id":6,"cmd":"set_app_perm_guard","params":{"package_name":"com.example.app","guard":{"auto_revoke_on_bg":["camera"],"locked_deny":["microphone"]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(r6.command, DaemonCommand::SetAppPermGuard { .. }));
+
+        let r7 = parse_ipc_request(
+            r#"{"id":7,"cmd":"bulk_revoke_category","params":{"category":"camera","packages":["com.a.b"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r7.command,
+            DaemonCommand::BulkRevokeCategory { .. }
+        ));
+
+        let r8 = parse_ipc_request(r#"{"id":8,"cmd":"trigger_panic_lockdown"}"#).unwrap();
+        assert!(matches!(r8.command, DaemonCommand::TriggerPanicLockdown));
+
+        let r9 = parse_ipc_request(
+            r#"{"id":9,"cmd":"set_radio_privacy","params":{"enhanced_mac_randomization":true,"disable_wifi_ble_scanning":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(r9.command, DaemonCommand::SetRadioPrivacy { .. }));
+
+        let r10 = parse_ipc_request(
+            r#"{"id":10,"cmd":"get_privacy_access_log","params":{"limit":50}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r10.command,
+            DaemonCommand::GetPrivacyAccessLog { limit: Some(50) }
+        ));
     }
 }

@@ -18,6 +18,7 @@ import dev.silo.app.data.AppInventory
 import dev.silo.app.ipc.ActiveConnection
 import dev.silo.app.ipc.AppFirewallRule
 import dev.silo.app.ipc.BlockedPacketEvent
+import dev.silo.app.ipc.PrivacyAccessEvent
 import dev.silo.app.ui.SiloUiState
 import dev.silo.app.ui.SiloViewModel
 import dev.silo.app.ui.i18n.LocalSiloStrings
@@ -26,7 +27,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private enum class TrafficTab { BLOCKED, LIVE, LISTENING }
+private enum class TrafficTab { BLOCKED, LIVE, ACCESS }
 
 @Composable
 fun TrafficScreen(
@@ -41,11 +42,14 @@ fun TrafficScreen(
         onDispose { vm.setMonitorPollingActive(false) }
     }
 
-    val liveSockets = remember(state.liveConnections) {
-        state.liveConnections.filter { !it.isListening }
+    LaunchedEffect(tab) {
+        if (tab == TrafficTab.ACCESS) {
+            vm.refreshPrivacyAccessLog()
+        }
     }
-    val listeningSockets = remember(state.liveConnections) {
-        state.liveConnections.filter { it.isListening }
+
+    val appLabelMap = remember(state.apps) {
+        state.apps.associate { it.packageName to it.label }
     }
 
     Column(
@@ -58,8 +62,8 @@ fun TrafficScreen(
         SiloSegmentBar(
             options = listOf(
                 TrafficTab.BLOCKED to "${s.trafficBlocked} (${state.telemetry.events.size})",
-                TrafficTab.LIVE to "${s.trafficLive} (${liveSockets.size})",
-                TrafficTab.LISTENING to "${s.trafficListen} (${listeningSockets.size})",
+                TrafficTab.LIVE to "${s.trafficLive} (${state.liveConnections.size})",
+                TrafficTab.ACCESS to "${s.trafficAccess} (${state.privacyAccessLog.size})",
             ),
             selected = tab,
             onSelect = { tab = it },
@@ -73,11 +77,11 @@ fun TrafficScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                s.ramOnlyBanner,
+                if (tab == TrafficTab.ACCESS) s.accessTimelineBanner else s.ramOnlyBanner,
                 style = MaterialTheme.typography.labelSmall,
-                color = SiloEmerald,
+                color = if (tab == TrafficTab.ACCESS) SiloCyan else SiloEmerald,
                 modifier = Modifier.weight(1f),
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             if (tab == TrafficTab.BLOCKED && state.telemetry.events.isNotEmpty()) {
@@ -86,6 +90,10 @@ fun TrafficScreen(
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                 ) {
                     Text(s.clearRing, style = MaterialTheme.typography.labelMedium)
+                }
+            } else if (tab == TrafficTab.ACCESS) {
+                IconButton(onClick = { vm.refreshPrivacyAccessLog() }, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                 }
             }
         }
@@ -112,7 +120,7 @@ fun TrafficScreen(
             }
 
             TrafficTab.LIVE -> {
-                if (liveSockets.isEmpty()) {
+                if (state.liveConnections.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(s.noConnections, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -121,12 +129,14 @@ fun TrafficScreen(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 20.dp),
                     ) {
-                        itemsIndexed(liveSockets) { idx, conn ->
+                        itemsIndexed(state.liveConnections) { idx, conn ->
                             SocketRow(
                                 conn = conn,
-                                onKill = { vm.killConnection(conn) },
-                                onBlock = {
-                                    if (!AppInventory.isProtectedUid(conn.uid)) {
+                                onKill = if (!conn.isListening) {
+                                    { vm.killConnection(conn) }
+                                } else null,
+                                onBlock = if (!conn.isListening && !AppInventory.isProtectedUid(conn.uid)) {
+                                    {
                                         vm.updateAppFirewallRule(
                                             conn.uid,
                                             AppFirewallRule(
@@ -138,31 +148,101 @@ fun TrafficScreen(
                                             ),
                                         )
                                     }
-                                },
+                                } else null,
                             )
-                            if (idx < liveSockets.lastIndex) SiloHairline()
+                            if (idx < state.liveConnections.lastIndex) SiloHairline()
                         }
                     }
                 }
             }
 
-            TrafficTab.LISTENING -> {
-                if (listeningSockets.isEmpty()) {
+            TrafficTab.ACCESS -> {
+                if (state.privacyAccessLog.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text(s.noConnections, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(s.noAccessEvents, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 } else {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 20.dp),
                     ) {
-                        itemsIndexed(listeningSockets) { idx, conn ->
-                            SocketRow(conn = conn, onKill = null, onBlock = null)
-                            if (idx < listeningSockets.lastIndex) SiloHairline()
+                        itemsIndexed(state.privacyAccessLog) { idx, ev ->
+                            PrivacyAccessRow(
+                                ev = ev,
+                                appLabel = appLabelMap[ev.packageName] ?: ev.packageName,
+                                categoryLabel = s.categoryLabel(ev.category),
+                                runningLabel = s.runningNowBadge,
+                                revokeLabel = s.revokeOne,
+                                onRevoke = {
+                                    vm.setAppPermissionAction(ev.packageName, ev.category, "revoke")
+                                    vm.refreshPrivacyAccessLog()
+                                },
+                            )
+                            if (idx < state.privacyAccessLog.lastIndex) SiloHairline()
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PrivacyAccessRow(
+    ev: PrivacyAccessEvent,
+    appLabel: String,
+    categoryLabel: String,
+    runningLabel: String,
+    revokeLabel: String,
+    onRevoke: () -> Unit,
+) {
+    val accent = when {
+        ev.runningNow -> SiloCrimson
+        ev.category in setOf("camera", "microphone", "location") -> SiloAmber
+        else -> SiloCyan
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 10.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    appLabel,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Surface(shape = RoundedCornerShape(6.dp), color = accent.copy(alpha = 0.16f)) {
+                    Text(
+                        if (ev.runningNow) "$categoryLabel • $runningLabel" else categoryLabel,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = accent,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            Text(
+                "${ev.op} (${ev.mode})  •  ${ev.lastAccessLabel}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        FilledTonalButton(
+            onClick = onRevoke,
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+            modifier = Modifier.height(32.dp),
+        ) {
+            Text(revokeLabel, style = MaterialTheme.typography.labelSmall, color = SiloCrimson)
         }
     }
 }
@@ -244,7 +324,7 @@ private fun SocketRow(
             }
             Text(
                 if (conn.isListening) {
-                    "${conn.localIp}:${conn.localPort}"
+                    "LISTEN  ${conn.localIp}:${conn.localPort}"
                 } else {
                     "${conn.remoteIp}:${conn.remotePort}  (:${conn.localPort})"
                 },
@@ -260,7 +340,7 @@ private fun SocketRow(
                 Icon(Icons.Rounded.Close, contentDescription = null, tint = SiloAmber, modifier = Modifier.size(18.dp))
             }
         }
-        if (onBlock != null && !AppInventory.isProtectedUid(conn.uid)) {
+        if (onBlock != null) {
             IconButton(onClick = onBlock, modifier = Modifier.size(34.dp)) {
                 Icon(Icons.Rounded.Block, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(18.dp))
             }

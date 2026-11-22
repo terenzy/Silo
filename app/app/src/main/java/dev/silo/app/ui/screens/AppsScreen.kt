@@ -2,6 +2,7 @@ package dev.silo.app.ui.screens
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -32,8 +33,34 @@ import dev.silo.app.ui.SiloViewModel
 import dev.silo.app.ui.i18n.LocalSiloStrings
 import dev.silo.app.ui.theme.*
 
-private enum class AppListFilter { USER, RESTRICTED, SYSTEM }
-private enum class AppSheetTab { NETWORK, SCOPES, FREEZER }
+private enum class AppListFilter { USER, RESTRICTED, AUDIT, SYSTEM }
+private enum class AppSheetTab { NETWORK, PERMS, FREEZER }
+
+private val ALL_PERM_CATEGORIES = listOf(
+    "camera",
+    "microphone",
+    "location",
+    "background_location",
+    "contacts",
+    "media",
+    "sms_calllog",
+    "clipboard",
+    "sensors",
+    "background",
+)
+
+private val AUDITABLE_CATEGORIES = listOf(
+    "all",
+    "camera",
+    "microphone",
+    "location",
+    "background_location",
+    "contacts",
+    "media",
+    "sms_calllog",
+    "sensors",
+    "background",
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -44,49 +71,59 @@ fun AppsScreen(
     val s = LocalSiloStrings.current
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(AppListFilter.USER) }
-    var selectedApp by remember { mutableStateOf<InstalledApp?>(null) }
+    var auditCategory by remember { mutableStateOf("all") }
+    var selectedAppPkg by remember { mutableStateOf<String?>(null) }
 
     val fw = state.config.firewall
-    val scopesMap = state.config.scopes.apps
-    val freezerMap = state.config.freezer.entries
-    val frozenUids = remember(state.freezerStatus.currentlyFrozenUids) {
-        state.freezerStatus.currentlyFrozenUids.toSet()
-    }
-    val suspendedPkgs = remember(state.freezerStatus.suspendedPackages) {
-        state.freezerStatus.suspendedPackages.toSet()
-    }
+    val defaultAllow = fw.mode == FirewallMode.DEFAULT_ALLOW
 
-    val filteredApps = remember(state.apps, query, filter, fw.rules, scopesMap, freezerMap) {
+    val filtered = remember(state.apps, query, filter, auditCategory, fw, state.config.scopes, state.config.freezer) {
         val q = query.trim().lowercase()
         state.apps.filter { app ->
             if (app.isProtected) return@filter false
-            val isRestricted = fw.rules.containsKey(app.uid) ||
-                scopesMap.containsKey(app.packageName) ||
-                freezerMap.containsKey(app.uid)
-            val matchesFilter = when (filter) {
-                AppListFilter.USER -> app.hasLauncher && !app.isSystem
-                AppListFilter.RESTRICTED -> isRestricted
-                AppListFilter.SYSTEM -> app.isSystem || !app.hasLauncher
-            }
             val matchesQuery = q.isEmpty() ||
                 app.label.lowercase().contains(q) ||
-                app.packageName.lowercase().contains(q) ||
-                app.uid.toString().contains(q)
-            matchesFilter && matchesQuery
+                app.packageName.lowercase().contains(q)
+            if (!matchesQuery) return@filter false
+
+            when (filter) {
+                AppListFilter.USER -> !app.isSystem && app.hasLauncher
+                AppListFilter.SYSTEM -> app.isSystem
+                AppListFilter.RESTRICTED -> {
+                    val r = fw.rules[app.uid]
+                    val hasNetBlock = r != null && (!r.allowWifi || !r.allowCellular || !r.allowVpn || !r.allowScreenOff)
+                    val hasScope = (state.config.scopes.apps[app.packageName]?.activeCount() ?: 0) > 0
+                    val hasGuard = (state.config.scopes.guards[app.packageName]?.totalCount() ?: 0) > 0
+                    val hasFreeze = state.config.freezer.entries.containsKey(app.uid)
+                    hasNetBlock || hasScope || hasGuard || hasFreeze
+                }
+                AppListFilter.AUDIT -> {
+                    if (auditCategory == "all") {
+                        app.grantedSensitiveCategories.isNotEmpty()
+                    } else {
+                        app.grantedSensitiveCategories.contains(auditCategory)
+                    }
+                }
+            }
         }
     }
 
-    selectedApp?.let { app ->
+    // Resolve live selectedApp from fresh state.apps so Risk & Granted Perms update immediately!
+    val selectedApp = remember(selectedAppPkg, state.apps) {
+        selectedAppPkg?.let { pkg -> state.apps.firstOrNull { it.packageName == pkg } }
+    }
+
+    if (selectedApp != null) {
         ModalBottomSheet(
-            onDismissRequest = { selectedApp = null },
+            onDismissRequest = { selectedAppPkg = null },
             containerColor = MaterialTheme.colorScheme.surface,
         ) {
             AppControlSheet(
-                app = app,
+                app = selectedApp,
                 state = state,
                 vm = vm,
-                isFrozen = frozenUids.contains(app.uid),
-                isSuspended = suspendedPkgs.contains(app.packageName),
+                isFrozen = state.freezerStatus.currentlyFrozenUids.contains(selectedApp.uid),
+                isSuspended = state.freezerStatus.suspendedPackages.contains(selectedApp.packageName),
             )
         }
     }
@@ -96,15 +133,16 @@ fun AppsScreen(
             .fillMaxSize()
             .padding(horizontal = 16.dp),
     ) {
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(6.dp))
 
-        // Borderless tonal search field
+        // Borderless tonal search bar
         TextField(
             value = query,
             onValueChange = { query = it },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp)),
             singleLine = true,
-            shape = RoundedCornerShape(14.dp),
             placeholder = { Text(s.searchApps, style = MaterialTheme.typography.bodyMedium) },
             leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(20.dp)) },
             trailingIcon = {
@@ -128,69 +166,144 @@ fun AppsScreen(
             options = listOf(
                 AppListFilter.USER to s.filterUser,
                 AppListFilter.RESTRICTED to s.filterRestricted,
+                AppListFilter.AUDIT to s.filterAudit,
                 AppListFilter.SYSTEM to s.filterSystem,
             ),
             selected = filter,
             onSelect = { filter = it },
         )
 
-        Spacer(Modifier.height(12.dp))
+        // Global Permission Audit Category Selector + Bulk Revoke
+        if (filter == AppListFilter.AUDIT) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                s.auditBanner,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                AUDITABLE_CATEGORIES.forEach { cat ->
+                    val label = if (cat == "all") s.auditAllCategories else s.categoryLabel(cat)
+                    val selected = auditCategory == cat
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { auditCategory = cat },
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                    ) {
+                        Text(
+                            label,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            if (auditCategory != "all" && filtered.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                FilledTonalButton(
+                    onClick = { vm.bulkRevokeCategory(auditCategory, filtered.map { it.packageName }) },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                ) {
+                    Icon(Icons.Rounded.RemoveModerator, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "${s.revokeAllVisible} (${s.categoryLabel(auditCategory)}: ${filtered.size})",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = SiloCrimson,
+                    )
+                }
+            }
+        }
 
-        if (filteredApps.isEmpty()) {
+        Spacer(Modifier.height(8.dp))
+
+        if (filtered.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(s.noAppsFound, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    if (filter == AppListFilter.AUDIT) s.noAppsWithPerm else s.noAppsFound,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 20.dp),
             ) {
-                itemsIndexed(filteredApps, key = { _, app -> "${app.uid}:${app.packageName}" }) { index, app ->
-                    val defaultAllow = fw.mode == FirewallMode.DEFAULT_ALLOW
-                    val rule = fw.rules[app.uid] ?: AppFirewallRule(
-                        packageName = app.packageName,
-                        allowWifi = defaultAllow,
-                        allowCellular = defaultAllow,
-                        allowVpn = defaultAllow,
-                        allowLan = false,
-                        allowScreenOff = defaultAllow,
-                    )
-                    val scopeCount = scopesMap[app.packageName]?.activeCount() ?: 0
-                    val isFrozen = frozenUids.contains(app.uid)
-                    val isSuspended = suspendedPkgs.contains(app.packageName)
-                    val tempSecs = state.status.tempUnblocksRemaining[app.uid]
+                itemsIndexed(filtered, key = { _, app -> app.packageName }) { idx, app ->
+                    if (filter == AppListFilter.AUDIT) {
+                        AuditAppRow(
+                            app = app,
+                            selectedCategory = auditCategory,
+                            onOpen = { selectedAppPkg = app.packageName },
+                            onRevoke = {
+                                if (auditCategory == "all") {
+                                    vm.revokeAllSensitiveForApp(app)
+                                } else {
+                                    vm.setAppPermissionAction(app.packageName, auditCategory, "revoke")
+                                }
+                            },
+                        )
+                    } else {
+                        // Safe default rule: ALWAYS allowScreenOff = true on quick toggle so user is never surprised!
+                        val rule = fw.rules[app.uid] ?: AppFirewallRule(
+                            packageName = app.packageName,
+                            allowWifi = defaultAllow,
+                            allowCellular = defaultAllow,
+                            allowVpn = defaultAllow,
+                            allowLan = false,
+                            allowScreenOff = true,
+                        )
+                        val isFrozen = state.freezerStatus.currentlyFrozenUids.contains(app.uid)
+                        val isSuspended = state.freezerStatus.suspendedPackages.contains(app.packageName)
+                        val guardCount = state.config.scopes.guards[app.packageName]?.totalCount() ?: 0
+                        val tempLeft = state.status.tempUnblocksRemaining[app.uid]
 
-                    CompactAppRow(
-                        app = app,
-                        rule = rule,
-                        scopeCount = scopeCount,
-                        isFrozen = isFrozen,
-                        isSuspended = isSuspended,
-                        tempUnblockSecs = tempSecs,
-                        onClickRow = { selectedApp = app },
-                        onToggleWifi = {
-                            vm.updateAppFirewallRule(
-                                app.uid,
-                                rule.copy(packageName = app.packageName, allowWifi = !rule.allowWifi),
-                            )
-                        },
-                        onToggleCell = {
-                            vm.updateAppFirewallRule(
-                                app.uid,
-                                rule.copy(packageName = app.packageName, allowCellular = !rule.allowCellular),
-                            )
-                        },
-                        onToggleFreeze = {
-                            if (isFrozen || isSuspended) {
-                                vm.thawUidNow(app.uid)
-                            } else {
-                                vm.freezeUidNow(app.uid)
-                            }
-                        },
-                    )
-                    if (index < filteredApps.lastIndex) {
-                        SiloHairline()
+                        MinimalAppRow(
+                            app = app,
+                            rule = rule,
+                            isFrozen = isFrozen,
+                            isSuspended = isSuspended,
+                            guardCount = guardCount,
+                            tempUnblockSecs = tempLeft,
+                            onOpen = { selectedAppPkg = app.packageName },
+                            onToggleWifi = {
+                                vm.updateAppFirewallRule(
+                                    app.uid,
+                                    rule.copy(packageName = app.packageName, allowWifi = !rule.allowWifi),
+                                )
+                            },
+                            onToggleCell = {
+                                vm.updateAppFirewallRule(
+                                    app.uid,
+                                    rule.copy(packageName = app.packageName, allowCellular = !rule.allowCellular),
+                                )
+                            },
+                            onToggleFreeze = {
+                                if (isFrozen || isSuspended) {
+                                    vm.thawUidNow(app.uid)
+                                } else {
+                                    val existing = state.config.freezer.entries[app.uid]
+                                    if (existing == null) {
+                                        vm.setFreezerEntry(app.uid, FreezerEntry(packageName = app.packageName))
+                                    }
+                                    vm.freezeUidNow(app.uid)
+                                }
+                            },
+                        )
                     }
+                    if (idx < filtered.lastIndex) SiloHairline()
                 }
             }
         }
@@ -198,52 +311,92 @@ fun AppsScreen(
 }
 
 @Composable
-private fun CompactAppRow(
+private fun AuditAppRow(
+    app: InstalledApp,
+    selectedCategory: String,
+    onOpen: () -> Unit,
+    onRevoke: () -> Unit,
+) {
+    val s = LocalSiloStrings.current
+    val context = LocalContext.current
+    var iconBmp by remember(app.packageName) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(app.packageName) {
+        iconBmp = AppInventory.loadAppIcon(context, app.packageName)
+    }
+
+    val activeLabels = app.grantedSensitiveCategories.map { s.categoryLabel(it) }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpen)
+            .padding(vertical = 10.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        AppIconBox(iconBmp, app.label)
+        Column(Modifier.weight(1f)) {
+            Text(
+                app.label,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                activeLabels.joinToString(", "),
+                style = MaterialTheme.typography.labelSmall,
+                color = SiloAmber,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        FilledTonalButton(
+            onClick = onRevoke,
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+            modifier = Modifier.height(32.dp),
+        ) {
+            Text(
+                if (selectedCategory == "all") s.revokeAllVisible else s.revokeOne,
+                style = MaterialTheme.typography.labelSmall,
+                color = SiloCrimson,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MinimalAppRow(
     app: InstalledApp,
     rule: AppFirewallRule,
-    scopeCount: Int,
     isFrozen: Boolean,
     isSuspended: Boolean,
+    guardCount: Int,
     tempUnblockSecs: Long?,
-    onClickRow: () -> Unit,
+    onOpen: () -> Unit,
     onToggleWifi: () -> Unit,
     onToggleCell: () -> Unit,
     onToggleFreeze: () -> Unit,
 ) {
-    val context = LocalContext.current
     val s = LocalSiloStrings.current
-    val iconBitmap by produceState<ImageBitmap?>(initialValue = null, app.packageName) {
-        value = AppInventory.loadAppIcon(context, app.packageName)
+    val context = LocalContext.current
+    var iconBmp by remember(app.packageName) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(app.packageName) {
+        iconBmp = AppInventory.loadAppIcon(context, app.packageName)
     }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClickRow)
+            .clickable(onClick = onOpen)
             .padding(vertical = 10.dp, horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        // Real App Icon
-        if (iconBitmap != null) {
-            Image(
-                bitmap = iconBitmap!!,
-                contentDescription = app.label,
-                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
-            )
-        } else {
-            Surface(
-                modifier = Modifier.size(40.dp),
-                shape = RoundedCornerShape(10.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Rounded.Android, contentDescription = null, modifier = Modifier.size(22.dp))
-                }
-            }
-        }
+        AppIconBox(iconBmp, app.label)
 
-        Column(modifier = Modifier.weight(1f)) {
+        Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
                     app.label,
@@ -257,19 +410,21 @@ private fun CompactAppRow(
                     MiniTag(s.suspendedBadge, SiloCyan)
                 } else if (isFrozen) {
                     MiniTag(s.frozenBadge, SiloCyan)
-                } else if (scopeCount > 0) {
-                    MiniTag("$scopeCount", SiloEmerald)
+                } else if (guardCount > 0) {
+                    MiniTag("G:$guardCount", SiloEmerald)
                 }
             }
 
+            // Always show concrete reason — never an unexplained scary label!
             val metaParts = buildList {
                 if (tempUnblockSecs != null) {
                     add("${s.tempUnblockActive} ${(tempUnblockSecs / 60) + 1}m")
                 }
+                if (app.grantedSensitiveCategories.isNotEmpty()) {
+                    add("${app.grantedSensitiveCategories.size} ${s.activePermsShort}")
+                }
                 if (app.detectedTrackers.isNotEmpty()) {
                     add("${app.detectedTrackers.size} ${s.trackersFound}")
-                } else if (app.riskLevel == PrivacyRiskLevel.HIGH) {
-                    add(s.riskHigh)
                 }
                 if (isEmpty()) {
                     add(app.packageName)
@@ -277,8 +432,8 @@ private fun CompactAppRow(
             }
             val metaColor = when {
                 tempUnblockSecs != null -> SiloEmerald
-                app.riskLevel == PrivacyRiskLevel.HIGH -> SiloAmber
-                app.detectedTrackers.isNotEmpty() -> SiloAmber
+                app.riskLevel == PrivacyRiskLevel.HIGH -> SiloCrimson
+                app.riskLevel == PrivacyRiskLevel.MEDIUM -> SiloAmber
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             }
             Text(
@@ -290,7 +445,6 @@ private fun CompactAppRow(
             )
         }
 
-        // 3 ultra-clean borderless icon toggles (Wi-Fi / Cellular / Freeze)
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             InlineIconToggle(
                 icon = if (rule.allowWifi) Icons.Rounded.Wifi else Icons.Rounded.WifiOff,
@@ -313,6 +467,31 @@ private fun CompactAppRow(
                 inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
                 onClick = onToggleFreeze,
             )
+        }
+    }
+}
+
+@Composable
+private fun AppIconBox(iconBmp: ImageBitmap?, label: String) {
+    if (iconBmp != null) {
+        Image(
+            bitmap = iconBmp,
+            contentDescription = null,
+            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
+        )
+    } else {
+        Surface(
+            modifier = Modifier.size(40.dp),
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    label.take(1).uppercase(),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
     }
 }
@@ -362,6 +541,11 @@ private fun AppControlSheet(
     val s = LocalSiloStrings.current
     var tab by remember { mutableStateOf(AppSheetTab.NETWORK) }
 
+    // Fetch REAL-TIME AppOps state from daemon whenever this app sheet opens!
+    LaunchedEffect(app.packageName) {
+        vm.inspectAppPermissions(app.packageName)
+    }
+
     val fw = state.config.firewall
     val defaultAllow = fw.mode == FirewallMode.DEFAULT_ALLOW
     val rule = fw.rules[app.uid] ?: AppFirewallRule(
@@ -370,9 +554,10 @@ private fun AppControlSheet(
         allowCellular = defaultAllow,
         allowVpn = defaultAllow,
         allowLan = false,
-        allowScreenOff = defaultAllow,
+        allowScreenOff = true,
     )
-    val scope = state.config.scopes.apps[app.packageName] ?: AppIsolationScope()
+    val guard = state.config.scopes.guards[app.packageName] ?: AppPermGuard()
+    val livePerms = state.liveAppPerms[app.packageName]
     val freezerEntry = state.config.freezer.entries[app.uid]
     val tempRemaining = state.status.tempUnblocksRemaining[app.uid]
 
@@ -385,27 +570,87 @@ private fun AppControlSheet(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         // App Sheet Header
-        Column(Modifier.padding(horizontal = 4.dp)) {
-            Text(app.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text(
-                "${app.packageName}  •  UID ${app.uid}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (app.detectedTrackers.isNotEmpty()) {
-                Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(app.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "SDK: ${app.detectedTrackers.joinToString(", ")}",
+                    "${app.packageName}  •  UID ${app.uid}",
                     style = MaterialTheme.typography.labelSmall,
-                    color = SiloAmber,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            val (riskLabel, riskColor) = when (app.riskLevel) {
+                PrivacyRiskLevel.HIGH -> s.riskHigh to SiloCrimson
+                PrivacyRiskLevel.MEDIUM -> s.riskMedium to SiloAmber
+                PrivacyRiskLevel.LOW -> s.riskLow to SiloEmerald
+            }
+            MiniTag(riskLabel, riskColor)
+        }
+
+        // To-the-point Risk Breakdown & Actionable Mitigation Card
+        if (app.grantedSensitiveCategories.isNotEmpty() || app.detectedTrackers.isNotEmpty()) {
+            val accent = if (app.riskLevel == PrivacyRiskLevel.HIGH) SiloCrimson else SiloAmber
+            SiloGroup(color = accent.copy(alpha = 0.11f)) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        s.riskWhyTitle,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = accent,
+                    )
+                    if (app.grantedSensitiveCategories.isNotEmpty()) {
+                        val grantedText = app.grantedSensitiveCategories.joinToString(", ") { s.categoryLabel(it) }
+                        Text(
+                            "${s.riskActivePermsLabel}: $grantedText",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Text(
+                            s.riskFixPermsHint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Text(
+                            s.riskDeclaredOnlyNote,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (app.detectedTrackers.isNotEmpty()) {
+                        Text(
+                            "${s.riskTrackersLabel}: ${app.detectedTrackers.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SiloAmber,
+                        )
+                        Text(
+                            s.riskFixTrackersHint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (app.grantedSensitiveCategories.isNotEmpty()) {
+                        FilledTonalButton(
+                            onClick = { vm.revokeAllSensitiveForApp(app) },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        ) {
+                            Icon(Icons.Rounded.RemoveModerator, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(s.revokeAllSensPerms, style = MaterialTheme.typography.labelMedium, color = SiloCrimson)
+                        }
+                    }
+                }
             }
         }
 
         SiloSegmentBar(
             options = listOf(
                 AppSheetTab.NETWORK to s.sheetNetwork,
-                AppSheetTab.SCOPES to s.sheetScopes,
+                AppSheetTab.PERMS to s.sheetPerms,
                 AppSheetTab.FREEZER to s.sheetFreezer,
             ),
             selected = tab,
@@ -427,12 +672,16 @@ private fun AppControlSheet(
                         vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowVpn = it))
                     }
                     SiloHairline()
-                    SiloSwitchRow(s.allowScreenOff, s.allowScreenOffDesc, rule.allowScreenOff) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowScreenOff = it))
-                    }
-                    SiloHairline()
                     SiloSwitchRow(s.allowLan, s.allowLanDesc, rule.allowLan) {
                         vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowLan = it))
+                    }
+                    SiloHairline()
+                    // Crystal-clear non-inverted semantics: ON = Block while screen off!
+                    SiloSwitchRow(s.blockScreenOff, s.blockScreenOffDesc, !rule.allowScreenOff) { blockWhenAsleep ->
+                        vm.updateAppFirewallRule(
+                            app.uid,
+                            rule.copy(packageName = app.packageName, allowScreenOff = !blockWhenAsleep),
+                        )
                     }
                     SiloHairline()
                     SiloSwitchRow(s.blockHttp, s.blockHttpDesc, rule.blockCleartextHttp) {
@@ -448,15 +697,16 @@ private fun AppControlSheet(
                     }
                 }
 
-                // Temporary Internet Grant (15m / 30m / 1h)
+                // Temporary Unblock Timer
                 SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(s.tempUnblockTitle, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                         Text(s.tempUnblockDesc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (tempRemaining != null) {
                             FilledTonalButton(
-                                modifier = Modifier.fillMaxWidth(),
                                 onClick = { vm.clearTempUnblock(app.uid) },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
                             ) {
                                 Text("${s.revokeTempUnblock} (${(tempRemaining / 60) + 1}m)")
                             }
@@ -464,8 +714,9 @@ private fun AppControlSheet(
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 for (mins in listOf(15, 30, 60)) {
                                     FilledTonalButton(
-                                        modifier = Modifier.weight(1f),
                                         onClick = { vm.setTempUnblock(app.uid, mins) },
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(12.dp),
                                     ) { Text("${mins}m") }
                                 }
                             }
@@ -475,96 +726,280 @@ private fun AppControlSheet(
 
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilledTonalButton(
-                        modifier = Modifier.weight(1f),
                         onClick = { vm.killUidSockets(app.uid) },
-                    ) { Text(s.killTcpNow) }
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text(s.killTcpNow, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                     if (fw.rules.containsKey(app.uid)) {
-                        TextButton(onClick = { vm.removeAppFirewallRule(app.uid) }) { Text(s.reset) }
+                        TextButton(
+                            onClick = { vm.removeAppFirewallRule(app.uid) },
+                            shape = RoundedCornerShape(12.dp),
+                        ) { Text(s.resetNetRule) }
                     }
                 }
             }
 
-            AppSheetTab.SCOPES -> {
-                Text(s.scopesIntro, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        modifier = Modifier.weight(1f),
-                        onClick = { vm.applyHardenedScope(app.packageName) },
-                    ) { Text(s.isolateAllHardened) }
-                    if (scope.activeCount() > 0) {
-                        TextButton(onClick = { vm.clearAppScope(app.packageName) }) { Text(s.reset) }
-                    }
+            AppSheetTab.PERMS -> {
+                Text(
+                    s.permsHonestNote,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                Text(
+                    s.enforcerHint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SiloCyan,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+
+                val liveByCat = remember(livePerms) {
+                    livePerms?.categories?.associateBy { it.category }.orEmpty()
                 }
+
                 SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
-                    SiloSwitchRow(s.scopeContacts, s.scopeContactsDesc, scope.isolateContacts) {
-                        vm.setAppScope(app.packageName, scope.copy(isolateContacts = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeStorage, s.scopeStorageDesc, scope.isolateStorage) {
-                        vm.setAppScope(app.packageName, scope.copy(isolateStorage = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeSmsCall, s.scopeSmsCallDesc, scope.isolateSmsCalllog) {
-                        vm.setAppScope(app.packageName, scope.copy(isolateSmsCalllog = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeClipboard, s.scopeClipboardDesc, scope.blockClipboardRead) {
-                        vm.setAppScope(app.packageName, scope.copy(blockClipboardRead = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeSensors, s.scopeSensorsDesc, scope.restrictSensors) {
-                        vm.setAppScope(app.packageName, scope.copy(restrictSensors = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeBackground, s.scopeBackgroundDesc, scope.restrictBackground) {
-                        vm.setAppScope(app.packageName, scope.copy(restrictBackground = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeLocation, s.scopeLocationDesc, scope.isolateLocation) {
-                        vm.setAppScope(app.packageName, scope.copy(isolateLocation = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.scopeCamMic, s.scopeCamMicDesc, scope.blockCameraMic) {
-                        vm.setAppScope(app.packageName, scope.copy(blockCameraMic = it))
+                    ALL_PERM_CATEGORIES.forEachIndexed { idx, cat ->
+                        val catState = liveByCat[cat]
+                        val runtimeGranted = app.grantedSensitiveCategories.contains(cat)
+                        val appopsMode = catState?.appopsMode ?: "default"
+                        val runningNow = catState?.runningNow == true
+                        val lastAccess = catState?.lastAccess
+                        val isAutoRevoke = guard.autoRevokeOnBg.contains(cat)
+                        val isStrictLocked = guard.lockedDeny.contains(cat)
+
+                        PermissionCategoryControlRow(
+                            title = s.categoryLabel(cat),
+                            desc = s.categoryDesc(cat),
+                            runtimeGranted = runtimeGranted,
+                            appopsMode = appopsMode,
+                            runningNow = runningNow,
+                            lastAccess = lastAccess,
+                            isAutoRevoke = isAutoRevoke,
+                            isStrictLocked = isStrictLocked,
+                            onAction = { action -> vm.setAppPermissionAction(app.packageName, cat, action) },
+                            onToggleAutoRevoke = { vm.toggleAppAutoRevoke(app.packageName, cat, !isAutoRevoke) },
+                            onToggleStrictLock = { vm.toggleAppStrictLock(app.packageName, cat, !isStrictLocked) },
+                        )
+                        if (idx < ALL_PERM_CATEGORIES.lastIndex) SiloHairline()
                     }
                 }
             }
 
             AppSheetTab.FREEZER -> {
-                Text(s.freezerIntro, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                val entry = freezerEntry ?: FreezerEntry(packageName = app.packageName)
-
+                Text(
+                    s.freezerIntro,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                val inList = freezerEntry != null
+                val currentMode = freezerEntry?.mode ?: FreezeMode.SOFT_CGROUP
                 SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
-                    SiloSwitchRow(s.autoFreezeEntry, s.autoFreezeEntryDesc, freezerEntry != null) { enable ->
-                        if (enable) {
-                            vm.setFreezerEntry(app.uid, entry)
+                    SiloSwitchRow(s.autoFreezeEntry, s.autoFreezeEntryDesc, inList) { on ->
+                        if (on) {
+                            vm.setFreezerEntry(app.uid, FreezerEntry(packageName = app.packageName, mode = currentMode))
                         } else {
                             vm.removeFreezerEntry(app.uid)
                         }
                     }
-                }
-
-                SiloSegmentBar(
-                    options = listOf(
-                        FreezeMode.SOFT_CGROUP to s.freezeModeSoft,
-                        FreezeMode.DEEP_STOP to s.freezeModeDeep,
-                    ),
-                    selected = entry.mode,
-                    onSelect = { m -> vm.setFreezerEntry(app.uid, entry.copy(mode = m)) },
-                )
-
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (isFrozen || isSuspended) {
-                        Button(modifier = Modifier.weight(1f), onClick = { vm.thawUidNow(app.uid) }) {
-                            Text(s.thawNow)
-                        }
-                    } else {
-                        Button(modifier = Modifier.weight(1f), onClick = { vm.freezeUidNow(app.uid) }) {
-                            Text(s.freezeNow)
-                        }
+                    SiloHairline()
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SiloSegmentBar(
+                            options = listOf(
+                                FreezeMode.SOFT_CGROUP to s.freezeModeSoft,
+                                FreezeMode.DEEP_STOP to s.freezeModeDeep,
+                            ),
+                            selected = currentMode,
+                            onSelect = { m ->
+                                vm.setFreezerEntry(
+                                    app.uid,
+                                    (freezerEntry ?: FreezerEntry(packageName = app.packageName)).copy(mode = m),
+                                )
+                            },
+                        )
                     }
                 }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            if (freezerEntry == null) {
+                                vm.setFreezerEntry(app.uid, FreezerEntry(packageName = app.packageName, mode = currentMode))
+                            }
+                            vm.freezeUidNow(app.uid)
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text(s.freezeNow) }
+                    FilledTonalButton(
+                        onClick = { vm.thawUidNow(app.uid) },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text(s.thawNow) }
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun PermissionCategoryControlRow(
+    title: String,
+    desc: String,
+    runtimeGranted: Boolean,
+    appopsMode: String,
+    runningNow: Boolean,
+    lastAccess: String?,
+    isAutoRevoke: Boolean,
+    isStrictLocked: Boolean,
+    onAction: (String) -> Unit,
+    onToggleAutoRevoke: () -> Unit,
+    onToggleStrictLock: () -> Unit,
+) {
+    val s = LocalSiloStrings.current
+    val (statusLabel, statusColor) = when {
+        runningNow -> s.permStateRunning to SiloCrimson
+        appopsMode == "ignore" -> s.permStateIgnored to SiloEmerald
+        appopsMode == "deny" -> s.permStateDenied to SiloEmerald
+        appopsMode == "foreground" -> s.permStateForeground to SiloCyan
+        runtimeGranted -> s.permStateGranted to SiloAmber
+        else -> s.permStateDenied to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(desc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!lastAccess.isNullOrBlank()) {
+                    Text(
+                        "${s.lastAccessPrefix}: $lastAccess",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SiloCyan,
+                    )
+                }
+            }
+            MiniTag(statusLabel, statusColor)
+        }
+
+        // 4 real action pills: Normal / Foreground / Ignore / Revoke (pm revoke + ignore)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            SmallActionPill(
+                text = s.permActionNormal,
+                active = appopsMode == "default" || appopsMode == "allow",
+                accent = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.weight(1f),
+                onClick = { onAction("allow") },
+            )
+            SmallActionPill(
+                text = s.permActionFg,
+                active = appopsMode == "foreground",
+                accent = SiloCyan,
+                modifier = Modifier.weight(1f),
+                onClick = { onAction("foreground") },
+            )
+            SmallActionPill(
+                text = s.permActionIgnore,
+                active = appopsMode == "ignore",
+                accent = SiloEmerald,
+                modifier = Modifier.weight(1f),
+                onClick = { onAction("ignore") },
+            )
+            SmallActionPill(
+                text = s.permActionRevoke,
+                active = !runtimeGranted && (appopsMode == "ignore" || appopsMode == "deny"),
+                accent = SiloCrimson,
+                modifier = Modifier.weight(1f),
+                onClick = { onAction("revoke") },
+            )
+        }
+
+        // Daemon Enforcer toggles: Auto-Revoke on Close & Strict Lock
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            EnforcerPill(
+                text = s.enforcerAutoRevoke,
+                active = isAutoRevoke,
+                accent = SiloCyan,
+                modifier = Modifier.weight(1f),
+                onClick = onToggleAutoRevoke,
+            )
+            EnforcerPill(
+                text = s.enforcerStrictLock,
+                active = isStrictLocked,
+                accent = SiloAmber,
+                modifier = Modifier.weight(1f),
+                onClick = onToggleStrictLock,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SmallActionPill(
+    text: String,
+    active: Boolean,
+    accent: Color,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = modifier.clip(RoundedCornerShape(9.dp)).clickable(onClick = onClick),
+        shape = RoundedCornerShape(9.dp),
+        color = if (active) accent.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+    ) {
+        Box(Modifier.padding(vertical = 6.dp, horizontal = 3.dp), contentAlignment = Alignment.Center) {
+            Text(
+                text,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun EnforcerPill(
+    text: String,
+    active: Boolean,
+    accent: Color,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = modifier.clip(RoundedCornerShape(9.dp)).clickable(onClick = onClick),
+        shape = RoundedCornerShape(9.dp),
+        color = if (active) accent.copy(alpha = 0.18f) else Color.Transparent,
+    ) {
+        Row(
+            modifier = Modifier.padding(vertical = 5.dp, horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                if (active) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                contentDescription = null,
+                tint = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                modifier = Modifier.size(13.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                text,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

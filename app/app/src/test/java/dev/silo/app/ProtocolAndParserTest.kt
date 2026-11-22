@@ -19,9 +19,9 @@ class ProtocolAndParserTest {
     }
 
     @Test
-    fun siloConfigV2RoundTripsWithSnakeCaseRustSchema() {
+    fun siloConfigV3RoundTripsWithSnakeCaseRustSchema() {
         val cfg = SiloConfig(
-            schemaVersion = 2,
+            schemaVersion = 3,
             firewall = FirewallConfig(
                 enabled = true,
                 mode = FirewallMode.DEFAULT_DENY,
@@ -36,19 +36,31 @@ class ProtocolAndParserTest {
                         allowWifi = true,
                         allowCellular = false,
                         allowVpn = true,
+                        allowScreenOff = false,
                     )
                 ),
                 ipBlocklist = listOf("198.51.100.0/24"),
             ),
+            scopes = ScopesConfig(
+                guards = mapOf(
+                    "com.example.app" to AppPermGuard(
+                        autoRevokeOnBg = listOf("camera", "microphone"),
+                        lockedDeny = listOf("location"),
+                    )
+                ),
+            ),
             automation = AutomationConfig(
                 autoRebootEnabled = false,
                 autoRebootMinutes = 720,
+                usbAdbLockGuard = true,
             ),
         )
 
         val encoded = json.encodeToString(cfg)
         assertTrue(encoded.contains("\"default_deny\""))
         assertTrue(encoded.contains("\"anti_port_scan\":true"))
+        assertTrue(encoded.contains("\"usb_adb_lock_guard\":true"))
+        assertTrue(encoded.contains("\"auto_revoke_on_bg\""))
         assertTrue(encoded.contains("\"10277\""))
 
         val decoded = json.decodeFromString<SiloConfig>(encoded)
@@ -56,14 +68,36 @@ class ProtocolAndParserTest {
     }
 
     @Test
-    fun offlineRiskClassifierDetectsTrackersAndSensitivePermissions() {
-        val (risk, sensCount, trackers) = AppInventory.evaluateOfflineRisk(
-            permissions = listOf(
+    fun offlineRiskClassifierUsesGrantedPermissionsInsteadOfDeclaredOnly() {
+        // Declared many permissions in APK manifest, but ZERO granted right now -> LOW risk!
+        val ungrantedRes = AppInventory.evaluateOfflineRisk(
+            declaredPermissions = listOf(
                 "android.permission.READ_CONTACTS",
                 "android.permission.ACCESS_FINE_LOCATION",
                 "android.permission.CAMERA",
                 "android.permission.RECORD_AUDIO",
                 "android.permission.READ_SMS",
+            ),
+            grantedPermissions = emptyList(),
+            componentNames = emptyList(),
+        )
+        assertEquals(PrivacyRiskLevel.LOW, ungrantedRes.level)
+        assertTrue(ungrantedRes.grantedCategories.isEmpty())
+        assertEquals(5, ungrantedRes.declaredCategories.size)
+
+        // Actively granted 4+ sensitive categories + 3 tracker SDKs -> HIGH risk!
+        val activeRes = AppInventory.evaluateOfflineRisk(
+            declaredPermissions = listOf(
+                "android.permission.READ_CONTACTS",
+                "android.permission.ACCESS_FINE_LOCATION",
+                "android.permission.CAMERA",
+                "android.permission.RECORD_AUDIO",
+            ),
+            grantedPermissions = listOf(
+                "android.permission.READ_CONTACTS",
+                "android.permission.ACCESS_FINE_LOCATION",
+                "android.permission.CAMERA",
+                "android.permission.RECORD_AUDIO",
             ),
             componentNames = listOf(
                 "com.facebook.ads.AudienceNetworkActivity",
@@ -71,9 +105,9 @@ class ProtocolAndParserTest {
                 "com.google.firebase.analytics.FirebaseAnalyticsService",
             ),
         )
-        assertEquals(PrivacyRiskLevel.HIGH, risk)
-        assertEquals(5, sensCount)
-        assertEquals(3, trackers.size)
+        assertEquals(PrivacyRiskLevel.HIGH, activeRes.level)
+        assertEquals(4, activeRes.grantedCategories.size)
+        assertEquals(3, activeRes.detectedTrackers.size)
     }
 
     @Test
@@ -82,8 +116,10 @@ class ProtocolAndParserTest {
         val en = resolveStrings(AppLanguagePref.ENGLISH)
         assertEquals("Beranda", id.tabHome)
         assertEquals("Home", en.tabHome)
-        assertEquals("Aplikasi", id.tabApps)
-        assertEquals("Apps", en.tabApps)
+        assertEquals("Blokir saat Layar Mati", id.blockScreenOff)
+        assertEquals("Block While Screen Off", en.blockScreenOff)
+        assertEquals("Kamera", id.categoryLabel("camera"))
+        assertEquals("Camera", en.categoryLabel("camera"))
     }
 
     @Test

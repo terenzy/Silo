@@ -9,7 +9,23 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const VALID_PERM_CATEGORIES: &[&str] = &[
+    "camera",
+    "microphone",
+    "location",
+    "background_location",
+    "contacts",
+    "media",
+    "sms_calllog",
+    "clipboard",
+    "sensors",
+    "background",
+];
+
+pub fn is_valid_perm_category(cat: &str) -> bool {
+    VALID_PERM_CATEGORIES.contains(&cat)
+}
 pub const MIN_AUTO_REBOOT_MINUTES: u32 = 15;
 pub const MAX_AUTO_REBOOT_MINUTES: u32 = 10_080; // 7 days
 pub const MAX_BLOCKLIST_ENTRIES: usize = 50_000;
@@ -305,10 +321,27 @@ impl AppIsolationScope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AppPermGuard {
+    /// Categories automatically revoked (`pm revoke` + `appops ignore`) whenever the app leaves foreground or screen turns off.
+    pub auto_revoke_on_bg: Vec<String>,
+    /// Categories strictly locked to revoked/ignored; automatically re-enforced if changed externally.
+    pub locked_deny: Vec<String>,
+}
+
+impl AppPermGuard {
+    pub fn is_empty(&self) -> bool {
+        self.auto_revoke_on_bg.is_empty() && self.locked_deny.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScopesConfig {
     pub apps: BTreeMap<String, AppIsolationScope>,
+    /// Per-package real-time permission Enforcer rules (Auto-Revoke on BG + Strict Lock).
+    pub guards: BTreeMap<String, AppPermGuard>,
     pub auto_clear_clipboard: bool,
     pub clipboard_clear_secs: u32,
 }
@@ -317,6 +350,7 @@ impl Default for ScopesConfig {
     fn default() -> Self {
         Self {
             apps: BTreeMap::new(),
+            guards: BTreeMap::new(),
             auto_clear_clipboard: false,
             clipboard_clear_secs: 45,
         }
@@ -336,6 +370,7 @@ pub struct HardeningConfig {
     pub restrict_dmesg: bool,
     pub disable_tcp_timestamps: bool,
     pub harden_network_stack: bool,
+    pub harden_memory_and_ptrace: bool,
     pub ipv6_privacy_extensions: bool,
     pub tcp_congestion: String,
     pub default_qdisc: String,
@@ -354,6 +389,7 @@ impl Default for HardeningConfig {
             restrict_dmesg: true,
             disable_tcp_timestamps: true,
             harden_network_stack: true,
+            harden_memory_and_ptrace: true,
             ipv6_privacy_extensions: true,
             tcp_congestion: String::new(),
             default_qdisc: String::new(),
@@ -371,6 +407,9 @@ pub struct AutomationConfig {
     pub bluetooth_auto_off_enabled: bool,
     pub bluetooth_auto_off_minutes: u32,
     pub sensors_off_on_lock: bool,
+    /// GrapheneOS-inspired safe framework USB/ADB Lockscreen Guard:
+    /// sets `adb_enabled=0` and USB charge-only when screen locks (never touches Download Mode; stays off on unlock).
+    pub usb_adb_lock_guard: bool,
 }
 
 impl Default for AutomationConfig {
@@ -383,6 +422,7 @@ impl Default for AutomationConfig {
             bluetooth_auto_off_enabled: false,
             bluetooth_auto_off_minutes: 15,
             sensors_off_on_lock: false,
+            usb_adb_lock_guard: false,
         }
     }
 }
@@ -437,6 +477,18 @@ impl SiloConfig {
         self.scopes
             .apps
             .retain(|pkg, _| validate_package_name(pkg) && !is_protected_package(pkg));
+        self.scopes.guards.retain(|pkg, guard| {
+            if !validate_package_name(pkg) || is_protected_package(pkg) {
+                return false;
+            }
+            guard.auto_revoke_on_bg.retain(|c| is_valid_perm_category(c));
+            guard.auto_revoke_on_bg.sort();
+            guard.auto_revoke_on_bg.dedup();
+            guard.locked_deny.retain(|c| is_valid_perm_category(c));
+            guard.locked_deny.sort();
+            guard.locked_deny.dedup();
+            !guard.is_empty()
+        });
 
         if self.firewall.ip_blocklist.len() > MAX_BLOCKLIST_ENTRIES {
             return Err(format!(
@@ -506,6 +558,7 @@ impl SiloConfig {
                 self.freezer.enabled = false;
                 self.scopes.auto_clear_clipboard = false;
                 self.automation.sensors_off_on_lock = false;
+                self.automation.usb_adb_lock_guard = false;
             }
             SecurityPreset::Balanced => {
                 self.firewall.enabled = true;
@@ -519,6 +572,7 @@ impl SiloConfig {
                 self.firewall.block_new_apps = false;
                 self.hardening.enabled = true;
                 self.hardening.disable_tcp_timestamps = true;
+                self.hardening.harden_memory_and_ptrace = true;
                 self.hardening.ipv6_privacy_extensions = true;
                 self.scopes.auto_clear_clipboard = true;
                 self.scopes.clipboard_clear_secs = 60;
@@ -544,6 +598,7 @@ impl SiloConfig {
                 self.hardening.restrict_dmesg = true;
                 self.hardening.disable_tcp_timestamps = true;
                 self.hardening.harden_network_stack = true;
+                self.hardening.harden_memory_and_ptrace = true;
                 self.hardening.ipv6_privacy_extensions = true;
                 self.scopes.auto_clear_clipboard = true;
                 self.scopes.clipboard_clear_secs = 45;
@@ -556,6 +611,7 @@ impl SiloConfig {
                 self.scopes.clipboard_clear_secs = 30;
                 self.automation.wifi_auto_off_enabled = true;
                 self.automation.bluetooth_auto_off_enabled = true;
+                self.automation.usb_adb_lock_guard = true;
             }
         }
     }

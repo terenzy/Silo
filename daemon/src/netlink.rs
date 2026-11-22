@@ -601,6 +601,27 @@ pub fn destroy_uid_sockets(target_uid: u32) -> usize {
     killed
 }
 
+/// Kills all active non-listening TCP (v4 + v6) sockets owned by non-protected user apps (UID >= 10000).
+/// Used by 1-tap non-destructive Panic Lockdown.
+pub fn destroy_all_user_sockets() -> usize {
+    let mut killed = 0usize;
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        if let Ok(list) = dump_inet_sockets(family, libc::IPPROTO_TCP as u8) {
+            for sk in list {
+                let app_id = sk.uid % 100_000;
+                if (10_000..90_000).contains(&app_id)
+                    && sk.state != 10
+                    && sk.state != 6
+                    && destroy_socket(&sk).is_ok()
+                {
+                    killed += 1;
+                }
+            }
+        }
+    }
+    killed
+}
+
 pub fn destroy_matching_connection(
     family: u8,
     local_ip: &str,

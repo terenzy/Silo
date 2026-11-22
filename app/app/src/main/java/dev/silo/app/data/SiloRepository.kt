@@ -201,6 +201,39 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
             put("package_name", packageName)
         }).map { }
 
+    suspend fun inspectAppPermissions(packageName: String): Result<AppLivePermissions> =
+        client.call("inspect_app_permissions", buildJsonObject {
+            put("package_name", packageName)
+        })
+
+    suspend fun setAppPermissionAction(
+        packageName: String,
+        category: String,
+        action: String,
+    ): Result<AppLivePermissions> =
+        client.call("set_app_permission_action", buildJsonObject {
+            put("package_name", packageName)
+            put("category", category)
+            put("action", action)
+        })
+
+    suspend fun setAppPermGuard(packageName: String, guard: AppPermGuard): Result<ScopesConfig> =
+        client.call("set_app_perm_guard", buildJsonObject {
+            put("package_name", packageName)
+            put("guard", json.encodeToJsonElement(guard))
+        })
+
+    suspend fun bulkRevokeCategory(category: String, packages: List<String>): Result<Int> =
+        client.call<JsonObject>("bulk_revoke_category", buildJsonObject {
+            put("category", category)
+            put("packages", json.encodeToJsonElement(packages))
+        }, timeoutMs = 25_000L).map { it["revoked_count"]?.jsonPrimitive?.intOrNull ?: 0 }
+
+    suspend fun getPrivacyAccessLog(limit: Int = 80): Result<List<PrivacyAccessEvent>> =
+        client.call("get_privacy_access_log", buildJsonObject {
+            put("limit", limit)
+        }, timeoutMs = 15_000L)
+
     suspend fun setAutoClearClipboard(enabled: Boolean, clearSecs: Int): Result<ScopesConfig> =
         client.call("set_auto_clear_clipboard", buildJsonObject {
             put("enabled", enabled)
@@ -226,16 +259,36 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
             put("config", json.encodeToJsonElement(config))
         })
 
-    suspend fun setSensorsOff(enabled: Boolean): Result<Boolean> =
-        client.call<JsonObject>("set_sensors_off", buildJsonObject {
+    suspend fun setSensorsOff(enabled: Boolean): Result<SensorPrivacyState> =
+        client.call("set_sensors_off", buildJsonObject {
             put("enabled", enabled)
-        }).map { it["sensors_off"]?.jsonPrimitive?.booleanOrNull ?: enabled }
+        })
+
+    suspend fun setSensorPrivacy(sensor: String, enabled: Boolean): Result<SensorPrivacyState> =
+        client.call("set_sensor_privacy", buildJsonObject {
+            put("sensor", sensor)
+            put("enabled", enabled)
+        })
 
     suspend fun setPrivateDns(mode: String, specifier: String = ""): Result<PrivateDnsState> =
         client.call("set_private_dns", buildJsonObject {
             put("mode", mode)
             put("specifier", specifier)
         })
+
+    suspend fun setRadioPrivacy(
+        enhancedMacRandomization: Boolean? = null,
+        disableWifiBleScanning: Boolean? = null,
+        disableCaptivePortal: Boolean? = null,
+    ): Result<RadioPrivacyState> =
+        client.call("set_radio_privacy", buildJsonObject {
+            if (enhancedMacRandomization != null) put("enhanced_mac_randomization", enhancedMacRandomization)
+            if (disableWifiBleScanning != null) put("disable_wifi_ble_scanning", disableWifiBleScanning)
+            if (disableCaptivePortal != null) put("disable_captive_portal", disableCaptivePortal)
+        })
+
+    suspend fun triggerPanicLockdown(): Result<PanicLockdownReport> =
+        client.call("trigger_panic_lockdown", timeoutMs = 15_000L)
 
     suspend fun triggerPanicReboot(): Result<Unit> =
         client.callRaw("trigger_panic_reboot", buildJsonObject {

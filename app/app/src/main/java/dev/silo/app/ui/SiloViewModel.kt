@@ -27,6 +27,8 @@ data class SiloUiState(
     val apps: List<InstalledApp> = emptyList(),
     val liveConnections: List<ActiveConnection> = emptyList(),
     val telemetry: TelemetrySnapshot = TelemetrySnapshot(),
+    val privacyAccessLog: List<PrivacyAccessEvent> = emptyList(),
+    val liveAppPerms: Map<String, AppLivePermissions> = emptyMap(),
     val freezerStatus: FreezerStatus = FreezerStatus(),
     val hardeningStatus: HardeningStatus = HardeningStatus(),
     val sentinelReport: SentinelReport? = null,
@@ -49,6 +51,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     val ui: StateFlow<SiloUiState> = _ui.asStateFlow()
 
     private var monitorJob: Job? = null
+    private var foregroundSyncJob: Job? = null
 
     init {
         refreshAll()
@@ -70,6 +73,45 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun setTheme(pref: AppThemePref) {
         repo.setThemePref(getApplication(), pref)
         _ui.update { it.copy(themePref = pref) }
+    }
+
+    /**
+     * Real-time sync triggered automatically on Activity ON_RESUME and lightweight 4s foreground tick.
+     * Ensures external changes (e.g. unblocking Mic/Camera from Android dialog, granting/revoking
+     * permissions in Settings, toggling Private DNS or ADB) appear immediately with 0% background drain.
+     */
+    fun onForegroundChanged(isResumed: Boolean) {
+        foregroundSyncJob?.cancel()
+        if (!isResumed) return
+
+        // Immediate real-time reload on resume (PackageManager granted perms + live daemon status)
+        viewModelScope.launch {
+            val appCtx = getApplication<Application>()
+            val freshApps = AppInventory.loadInstalledApps(appCtx)
+            val st = repo.getStatus().getOrNull()
+            val cfg = repo.getConfig().getOrNull()
+            _ui.update { cur ->
+                cur.copy(
+                    connected = st != null || cur.connected,
+                    status = st ?: cur.status,
+                    config = cfg ?: cur.config,
+                    apps = freshApps,
+                )
+            }
+        }
+
+        // Lightweight foreground live status poll every 4 seconds (stops immediately on pause)
+        foregroundSyncJob = viewModelScope.launch {
+            while (isActive) {
+                delay(4_000L)
+                if (_ui.value.connected) {
+                    val st = repo.getStatus().getOrNull()
+                    if (st != null) {
+                        _ui.update { it.copy(status = st) }
+                    }
+                }
+            }
+        }
     }
 
     fun refreshAll() {
@@ -125,6 +167,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         monitorJob?.cancel()
         if (!active) return
         monitorJob = viewModelScope.launch {
+            refreshPrivacyAccessLog()
             while (isActive) {
                 if (_ui.value.connected && _ui.value.monitorAutoRefresh) {
                     refreshMonitorOnce()
@@ -132,10 +175,6 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 delay(3_000L)
             }
         }
-    }
-
-    fun toggleMonitorAutoRefresh(enabled: Boolean) {
-        _ui.update { it.copy(monitorAutoRefresh = enabled) }
     }
 
     fun refreshMonitorOnce() {
@@ -149,6 +188,14 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                     telemetry = tel ?: cur.telemetry,
                     status = st ?: cur.status,
                 )
+            }
+        }
+    }
+
+    fun refreshPrivacyAccessLog() {
+        viewModelScope.launch {
+            repo.getPrivacyAccessLog(80).onSuccess { events ->
+                _ui.update { it.copy(privacyAccessLog = events) }
             }
         }
     }
@@ -250,28 +297,26 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Blocklist aktif: ${obj["loaded"]} entri (${obj["backend"]})")
+                val loaded = obj["loaded"]?.toString() ?: parsed.size.toString()
+                toast("Memuat $loaded IP/CIDR ke kernel")
             }.onFailure { e ->
-                toast("Blocklist error: ${e.message}")
+                toast("Gagal impor blocklist: ${e.message}")
             }
         }
     }
 
     fun addSingleBlocklistCidr(cidr: String) {
-        val cleaned = BlocklistParser.parseLines(cidr)
-        if (cleaned.isEmpty()) {
-            toast("Format IP/CIDR tidak valid")
-            return
-        }
-        val merged = (_ui.value.config.firewall.ipBlocklist + cleaned).distinct()
+        val clean = cidr.trim()
+        if (clean.isEmpty()) return
+        val next = (_ui.value.config.firewall.ipBlocklist + clean).distinct()
         viewModelScope.launch {
-            repo.replaceIpBlocklist(merged).onSuccess {
+            repo.replaceIpBlocklist(next).onSuccess {
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Ditambahkan: ${cleaned.first()}")
+                toast("Ditambahkan: $clean")
             }.onFailure { e ->
-                toast("Gagal: ${e.message}")
+                toast("IP/CIDR tidak valid: ${e.message}")
             }
         }
     }
@@ -282,9 +327,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Blocklist IP dikosongkan")
-            }.onFailure { e ->
-                toast("Gagal: ${e.message}")
+                toast("Daftar blokir IP dikosongkan")
             }
         }
     }
@@ -292,8 +335,10 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun emergencyFlushFirewall() {
         viewModelScope.launch {
             repo.emergencyFlushFirewall().onSuccess {
-                refreshAll()
-                toast("Semua aturan SILO_* di kernel telah dibersihkan")
+                val cfg = repo.getConfig().getOrDefault(_ui.value.config)
+                _ui.update { it.copy(config = cfg) }
+                refreshLightStatus()
+                toast("Flush darurat berhasil: semua aturan SILO_* dicabut")
             }.onFailure { e ->
                 toast("Flush gagal: ${e.message}")
             }
@@ -302,22 +347,22 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun killUidSockets(uid: Int) {
         viewModelScope.launch {
-            repo.killUidSockets(uid).onSuccess { killed ->
+            repo.killUidSockets(uid).onSuccess { n ->
+                toast("Memutus $n koneksi TCP aktif")
                 refreshMonitorOnce()
-                toast("SOCK_DESTROY memutus $killed soket TCP aktif")
             }.onFailure { e ->
-                toast("Gagal memutus soket: ${e.message}")
+                toast("SOCK_DESTROY error: ${e.message}")
             }
         }
     }
 
     fun killConnection(conn: ActiveConnection) {
         viewModelScope.launch {
-            repo.killConnection(conn).onSuccess { killed ->
+            repo.killConnection(conn).onSuccess { n ->
+                toast("Diputus: $n soket")
                 refreshMonitorOnce()
-                toast("Memutus $killed soket TCP")
             }.onFailure { e ->
-                toast("Gagal memutus: ${e.message}")
+                toast("Gagal memutus soket: ${e.message}")
             }
         }
     }
@@ -325,24 +370,20 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun clearTelemetry() {
         viewModelScope.launch {
             repo.clearTelemetry().onSuccess {
-                _ui.update { it.copy(telemetry = TelemetrySnapshot()) }
-                toast("Log RAM dibersihkan")
+                refreshMonitorOnce()
             }
         }
     }
 
     fun setFreezerEnabled(enabled: Boolean, graceSecs: Int) {
         viewModelScope.launch {
-            repo.setFreezerEnabled(enabled, graceSecs).onSuccess { fs ->
-                _ui.update {
-                    it.copy(
-                        freezerStatus = fs,
-                        config = it.config.copy(
-                            freezer = it.config.freezer.copy(
-                                enabled = enabled,
-                                backgroundGraceSecs = graceSecs,
-                            )
+            repo.setFreezerEnabled(enabled, graceSecs).onSuccess { fz ->
+                _ui.update { cur ->
+                    cur.copy(
+                        config = cur.config.copy(
+                            freezer = cur.config.freezer.copy(enabled = enabled, backgroundGraceSecs = graceSecs)
                         ),
+                        freezerStatus = fz,
                     )
                 }
                 refreshLightStatus()
@@ -354,13 +395,13 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setFreezerEntry(uid: Int, entry: FreezerEntry) {
         viewModelScope.launch {
-            repo.setFreezerEntry(uid, entry).onSuccess { fs ->
+            repo.setFreezerEntry(uid, entry).onSuccess { fz ->
                 _ui.update { cur ->
-                    val next = cur.config.freezer.entries.toMutableMap()
-                    next[uid] = entry
+                    val map = cur.config.freezer.entries.toMutableMap()
+                    map[uid] = entry
                     cur.copy(
-                        freezerStatus = fs,
-                        config = cur.config.copy(freezer = cur.config.freezer.copy(entries = next)),
+                        config = cur.config.copy(freezer = cur.config.freezer.copy(entries = map)),
+                        freezerStatus = fz,
                     )
                 }
             }.onFailure { e ->
@@ -371,127 +412,185 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun removeFreezerEntry(uid: Int) {
         viewModelScope.launch {
-            repo.removeFreezerEntry(uid).onSuccess { fs ->
+            repo.removeFreezerEntry(uid).onSuccess { fz ->
                 _ui.update { cur ->
-                    val next = cur.config.freezer.entries.toMutableMap()
-                    next.remove(uid)
+                    val map = cur.config.freezer.entries.toMutableMap()
+                    map.remove(uid)
                     cur.copy(
-                        freezerStatus = fs,
-                        config = cur.config.copy(freezer = cur.config.freezer.copy(entries = next)),
+                        config = cur.config.copy(freezer = cur.config.freezer.copy(entries = map)),
+                        freezerStatus = fz,
                     )
                 }
+                refreshLightStatus()
             }
         }
     }
 
     fun freezeUidNow(uid: Int) {
         viewModelScope.launch {
-            repo.freezeUidNow(uid).onSuccess { fs ->
-                _ui.update { it.copy(freezerStatus = fs) }
+            repo.freezeUidNow(uid).onSuccess { fz ->
+                _ui.update { it.copy(freezerStatus = fz) }
                 refreshLightStatus()
-                toast(fs.lastActionDetail ?: "UID $uid dibekukan")
+                toast(fz.lastActionDetail ?: "Aplikasi dibekukan")
             }.onFailure { e ->
-                toast("Freeze gagal: ${e.message}")
+                toast("Gagal membekukan: ${e.message}")
             }
         }
     }
 
     fun thawUidNow(uid: Int) {
         viewModelScope.launch {
-            repo.thawUidNow(uid).onSuccess { fs ->
-                _ui.update { it.copy(freezerStatus = fs) }
+            repo.thawUidNow(uid).onSuccess { fz ->
+                _ui.update { it.copy(freezerStatus = fz) }
                 refreshLightStatus()
-                toast("UID $uid dicairkan")
+                toast("Aplikasi dicairkan")
             }.onFailure { e ->
-                toast("Thaw gagal: ${e.message}")
+                toast("Gagal mencairkan: ${e.message}")
             }
         }
     }
 
     fun thawAllNow() {
         viewModelScope.launch {
-            repo.thawAllNow().onSuccess { fs ->
-                _ui.update { it.copy(freezerStatus = fs) }
+            repo.thawAllNow().onSuccess { fz ->
+                _ui.update { it.copy(freezerStatus = fz) }
                 refreshLightStatus()
-                toast("Semua aplikasi beku & suspend dicairkan")
+                toast("Semua aplikasi dicairkan")
             }
         }
     }
 
-    fun setAppScope(packageName: String, scope: AppIsolationScope) {
+    // --- Real-Time Per-App Permissions, AppOps & Enforcer ---
+
+    fun inspectAppPermissions(packageName: String) {
         viewModelScope.launch {
-            repo.setAppScope(packageName, scope).onSuccess {
+            repo.inspectAppPermissions(packageName).onSuccess { live ->
                 _ui.update { cur ->
-                    val next = cur.config.scopes.apps.toMutableMap()
-                    if (scope.activeCount() > 0) next[packageName] = scope else next.remove(packageName)
-                    cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
+                    val nextMap = cur.liveAppPerms.toMutableMap()
+                    nextMap[packageName] = live
+                    cur.copy(liveAppPerms = nextMap)
                 }
+            }
+        }
+    }
+
+    fun setAppPermissionAction(packageName: String, category: String, action: String) {
+        viewModelScope.launch {
+            repo.setAppPermissionAction(packageName, category, action).onSuccess { live ->
+                val freshApps = AppInventory.loadInstalledApps(getApplication())
+                _ui.update { cur ->
+                    val nextMap = cur.liveAppPerms.toMutableMap()
+                    nextMap[packageName] = live
+                    cur.copy(liveAppPerms = nextMap, apps = freshApps)
+                }
+                refreshLightStatus()
             }.onFailure { e ->
-                toast("Scope gagal: ${e.message}")
+                toast("Izin error: ${e.message}")
             }
         }
     }
 
-    fun applyHardenedScope(packageName: String) {
+    fun toggleAppAutoRevoke(packageName: String, category: String, enabled: Boolean) {
+        val current = _ui.value.config.scopes.guards[packageName] ?: AppPermGuard()
+        val nextAuto = if (enabled) {
+            (current.autoRevokeOnBg + category).distinct()
+        } else {
+            current.autoRevokeOnBg.filter { it != category }
+        }
+        saveAppPermGuard(packageName, current.copy(autoRevokeOnBg = nextAuto))
+    }
+
+    fun toggleAppStrictLock(packageName: String, category: String, enabled: Boolean) {
+        val current = _ui.value.config.scopes.guards[packageName] ?: AppPermGuard()
+        val nextLocked = if (enabled) {
+            (current.lockedDeny + category).distinct()
+        } else {
+            current.lockedDeny.filter { it != category }
+        }
+        saveAppPermGuard(packageName, current.copy(lockedDeny = nextLocked))
+    }
+
+    private fun saveAppPermGuard(packageName: String, guard: AppPermGuard) {
         viewModelScope.launch {
-            repo.applyHardenedScope(packageName).onSuccess { profile ->
+            repo.setAppPermGuard(packageName, guard).onSuccess { scopes ->
+                val freshApps = AppInventory.loadInstalledApps(getApplication())
                 _ui.update { cur ->
-                    val next = cur.config.scopes.apps.toMutableMap()
-                    next[packageName] = profile
-                    cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
+                    cur.copy(
+                        config = cur.config.copy(scopes = scopes),
+                        apps = freshApps,
+                    )
                 }
-                toast("Isolasi penuh diterapkan ke $packageName")
+                inspectAppPermissions(packageName)
+                refreshLightStatus()
             }.onFailure { e ->
-                toast("Gagal: ${e.message}")
+                toast("Guard error: ${e.message}")
             }
         }
     }
 
-    fun clearAppScope(packageName: String) {
+    fun revokeAllSensitiveForApp(app: InstalledApp) {
+        val cats = app.grantedSensitiveCategories.toList()
+        if (cats.isEmpty()) return
         viewModelScope.launch {
-            repo.clearAppScope(packageName).onSuccess {
-                _ui.update { cur ->
-                    val next = cur.config.scopes.apps.toMutableMap()
-                    next.remove(packageName)
-                    cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
+            var count = 0
+            for (cat in cats) {
+                if (repo.setAppPermissionAction(app.packageName, cat, "revoke").isSuccess) {
+                    count++
                 }
-                toast("Isolasi direset untuk $packageName")
+            }
+            val freshApps = AppInventory.loadInstalledApps(getApplication())
+            _ui.update { it.copy(apps = freshApps) }
+            inspectAppPermissions(app.packageName)
+            refreshLightStatus()
+            toast("Mencabut $count kategori izin sensitif pada ${app.label}")
+        }
+    }
+
+    fun bulkRevokeCategory(category: String, packages: List<String>) {
+        if (packages.isEmpty()) return
+        viewModelScope.launch {
+            repo.bulkRevokeCategory(category, packages).onSuccess { revoked ->
+                val freshApps = AppInventory.loadInstalledApps(getApplication())
+                _ui.update { it.copy(apps = freshApps) }
+                refreshLightStatus()
+                toast("Berhasil mencabut izin $category pada $revoked aplikasi")
+            }.onFailure { e ->
+                toast("Cabut massal gagal: ${e.message}")
             }
         }
     }
 
     fun setAutoClearClipboard(enabled: Boolean, clearSecs: Int) {
         viewModelScope.launch {
-            repo.setAutoClearClipboard(enabled, clearSecs).onSuccess { saved ->
-                _ui.update { it.copy(config = it.config.copy(scopes = saved)) }
-            }.onFailure { e ->
-                toast("Clipboard error: ${e.message}")
+            repo.setAutoClearClipboard(enabled, clearSecs).onSuccess { scopes ->
+                _ui.update { it.copy(config = it.config.copy(scopes = scopes)) }
             }
         }
     }
 
-    /** Uses native Android ClipboardManager FIRST (guaranteed on One UI 7), plus daemon fallback. */
     fun clearClipboardNow() {
-        val nativeOk = repo.clearClipboardNative(getApplication())
         viewModelScope.launch {
-            val daemonOk = repo.clearClipboardNow().isSuccess
-            toast(
-                if (nativeOk || daemonOk) "Clipboard berhasil dihapus"
-                else "Clipboard gagal dihapus"
-            )
+            val nativeOk = repo.clearClipboardNative(getApplication())
+            val daemonRes = repo.clearClipboardNow()
+            if (nativeOk || daemonRes.isSuccess) {
+                toast("Clipboard dibersihkan")
+            } else {
+                toast("Gagal membersihkan clipboard: ${daemonRes.exceptionOrNull()?.message}")
+            }
         }
     }
 
     fun updateHardeningConfig(transform: (HardeningConfig) -> HardeningConfig) {
         val next = transform(_ui.value.config.hardening)
         viewModelScope.launch {
-            repo.setHardeningConfig(next).onSuccess { hs ->
-                _ui.update {
-                    it.copy(
-                        hardeningStatus = hs,
-                        config = it.config.copy(hardening = next),
+            repo.setHardeningConfig(next).onSuccess { hStatus ->
+                _ui.update { cur ->
+                    cur.copy(
+                        config = cur.config.copy(hardening = next),
+                        hardeningStatus = hStatus,
                     )
                 }
+                refreshLightStatus()
             }.onFailure { e ->
                 toast("Hardening error: ${e.message}")
             }
@@ -500,16 +599,14 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun rollbackHardening() {
         viewModelScope.launch {
-            repo.rollbackHardening().onSuccess { hs ->
-                _ui.update {
-                    it.copy(
-                        hardeningStatus = hs,
-                        config = it.config.copy(hardening = it.config.hardening.copy(enabled = false)),
+            repo.rollbackHardening().onSuccess { hStatus ->
+                _ui.update { cur ->
+                    cur.copy(
+                        config = cur.config.copy(hardening = cur.config.hardening.copy(enabled = false)),
+                        hardeningStatus = hStatus,
                     )
                 }
-                toast("Semua parameter sysctl dikembalikan ke default")
-            }.onFailure { e ->
-                toast("Rollback gagal: ${e.message}")
+                toast("Seluruh sysctl dikembalikan ke default kernel")
             }
         }
     }
@@ -521,18 +618,26 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 _ui.update { it.copy(config = it.config.copy(automation = saved)) }
                 refreshLightStatus()
             }.onFailure { e ->
-                toast("Otomasi gagal: ${e.message}")
+                toast("Automation error: ${e.message}")
             }
         }
     }
 
-    fun setSensorsOff(enabled: Boolean) {
+    fun setSensorPrivacy(sensor: String, enabled: Boolean) {
         viewModelScope.launch {
-            repo.setSensorsOff(enabled).onSuccess { active ->
-                _ui.update { it.copy(status = it.status.copy(sensorsOffActive = active)) }
-                toast(if (active) "Sensor mikrofon & kamera dimatikan" else "Sensor dipulihkan")
+            repo.setSensorPrivacy(sensor, enabled).onSuccess { live ->
+                _ui.update { cur ->
+                    cur.copy(
+                        status = cur.status.copy(
+                            micMuted = live.micMuted,
+                            cameraMuted = live.cameraMuted,
+                            sensorsOffActive = live.micMuted || live.cameraMuted,
+                        )
+                    )
+                }
+                refreshLightStatus()
             }.onFailure { e ->
-                toast("Sensor toggle gagal: ${e.message}")
+                toast("Sensor privacy error: ${e.message}")
             }
         }
     }
@@ -540,11 +645,44 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun setPrivateDns(mode: String, specifier: String = "") {
         viewModelScope.launch {
             repo.setPrivateDns(mode, specifier).onSuccess { dns ->
-                _ui.update { it.copy(status = it.status.copy(privateDns = dns)) }
+                _ui.update { cur -> cur.copy(status = cur.status.copy(privateDns = dns)) }
                 val label = if (dns.mode == "hostname") dns.specifier else dns.mode
                 toast("Private DNS: $label")
             }.onFailure { e ->
-                toast("Private DNS gagal: ${e.message}")
+                toast("Private DNS error: ${e.message}")
+            }
+        }
+    }
+
+    fun setRadioPrivacy(
+        enhancedMacRandomization: Boolean? = null,
+        disableWifiBleScanning: Boolean? = null,
+        disableCaptivePortal: Boolean? = null,
+    ) {
+        viewModelScope.launch {
+            repo.setRadioPrivacy(
+                enhancedMacRandomization = enhancedMacRandomization,
+                disableWifiBleScanning = disableWifiBleScanning,
+                disableCaptivePortal = disableCaptivePortal,
+            ).onSuccess { rp ->
+                _ui.update { cur -> cur.copy(status = cur.status.copy(radioPrivacy = rp)) }
+                refreshLightStatus()
+            }.onFailure { e ->
+                toast("Radio privacy error: ${e.message}")
+            }
+        }
+    }
+
+    fun triggerPanicLockdown() {
+        viewModelScope.launch {
+            repo.clearClipboardNative(getApplication())
+            repo.triggerPanicLockdown().onSuccess { rep ->
+                val cfg = repo.getConfig().getOrDefault(_ui.value.config)
+                _ui.update { it.copy(config = cfg) }
+                refreshLightStatus()
+                toast("Panic Lockdown aktif: ${rep.socketsDestroyed} TCP diputus, Firewall Default-Deny, Mic/Cam & Radio dimatikan")
+            }.onFailure { e ->
+                toast("Panic Lockdown error: ${e.message}")
             }
         }
     }
@@ -561,21 +699,28 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.runSentinelAudit().onSuccess { report ->
                 _ui.update { it.copy(sentinelReport = report) }
+                toast("Skor Keamanan: ${report.score}/100")
             }.onFailure { e ->
                 toast("Audit gagal: ${e.message}")
             }
         }
     }
 
-    fun runLiveProof(onDone: (() -> Unit)? = null) {
+    fun runLiveProof(onReady: (() -> Unit)? = null) {
         viewModelScope.launch {
             repo.runLiveProof().onSuccess { proof ->
                 _ui.update { it.copy(liveProof = proof) }
-                onDone?.invoke()
+                onReady?.invoke()
             }.onFailure { e ->
-                toast("Live Proof gagal: ${e.message}")
+                toast("Uji Bukti Nyata gagal: ${e.message}")
             }
         }
+    }
+
+    fun setDisguiseEnabled(enabled: Boolean) {
+        repo.setDisguiseEnabled(getApplication(), enabled)
+        _ui.update { it.copy(disguiseEnabled = enabled) }
+        toast(if (enabled) "Samaran NetDiag aktif" else "Ikon Silo dikembalikan")
     }
 
     fun exportConfigToUri(uri: Uri) {
@@ -586,9 +731,10 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                         getApplication<Application>().contentResolver.openOutputStream(uri)?.use {
                             it.write(jsonStr.toByteArray(Charsets.UTF_8))
                         }
-                    }.isSuccess
+                        true
+                    }.getOrDefault(false)
                 }
-                toast(if (ok) "Backup berhasil diekspor" else "Gagal menulis file backup")
+                toast(if (ok) "Konfigurasi diekspor" else "Gagal menulis file backup")
             }.onFailure { e ->
                 toast("Ekspor gagal: ${e.message}")
             }
@@ -603,41 +749,25 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                         ?.use { it.readText() }
                 }.getOrNull()
             }
-            if (raw == null) {
-                toast("File backup tidak bisa dibaca")
+            if (raw.isNullOrBlank()) {
+                toast("File backup kosong atau tidak terbaca")
                 return@launch
             }
-            repo.importConfigJson(raw).onSuccess {
+            repo.importConfigJson(raw).onSuccess { imported ->
+                _ui.update { it.copy(config = imported) }
                 refreshAll()
-                toast("Konfigurasi berhasil diimpor")
+                toast("Konfigurasi dipulihkan")
             }.onFailure { e ->
                 toast("Impor gagal: ${e.message}")
             }
         }
     }
 
-    fun setDisguiseEnabled(enabled: Boolean) {
-        val ctx = getApplication<Application>()
-        repo.setDisguiseEnabled(ctx, enabled)
-        _ui.update { it.copy(disguiseEnabled = enabled) }
-        toast(if (enabled) "Launcher disamarkan sebagai NetDiag" else "Launcher dikembalikan ke Silo")
-    }
-
-    private suspend fun refreshLightStatus() {
-        val st = repo.getStatus().getOrNull()
-        val hs = repo.getHardeningStatus().getOrNull()
-        val fs = repo.getFreezerStatus().getOrNull()
-        _ui.update { cur ->
-            cur.copy(
-                status = st ?: cur.status,
-                hardeningStatus = hs ?: cur.hardeningStatus,
-                freezerStatus = fs ?: cur.freezerStatus,
-            )
+    private fun refreshLightStatus() {
+        viewModelScope.launch {
+            repo.getStatus().onSuccess { st ->
+                _ui.update { it.copy(status = st, connected = true) }
+            }
         }
-    }
-
-    override fun onCleared() {
-        monitorJob?.cancel()
-        super.onCleared()
     }
 }
