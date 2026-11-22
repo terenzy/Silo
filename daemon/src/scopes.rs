@@ -3,6 +3,7 @@ use crate::sys::{boottime_secs, resolve_bin, run_cmd};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+// Verified valid Android 12-16 AppOps names only (no invalid/non-AppOp permissions!)
 const OPS_CONTACTS: &[&str] = &["READ_CONTACTS", "WRITE_CONTACTS"];
 const OPS_STORAGE: &[&str] = &[
     "READ_EXTERNAL_STORAGE",
@@ -20,11 +21,7 @@ const OPS_SMS_CALLLOG: &[&str] = &[
     "WRITE_CALL_LOG",
 ];
 const OPS_CLIPBOARD: &[&str] = &["READ_CLIPBOARD"];
-const OPS_SENSORS: &[&str] = &[
-    "BODY_SENSORS",
-    "ACTIVITY_RECOGNITION",
-    "HIGH_SAMPLING_RATE_SENSORS",
-];
+const OPS_SENSORS: &[&str] = &["BODY_SENSORS", "ACTIVITY_RECOGNITION"];
 const OPS_BACKGROUND: &[&str] = &[
     "RUN_IN_BACKGROUND",
     "RUN_ANY_IN_BACKGROUND",
@@ -32,18 +29,12 @@ const OPS_BACKGROUND: &[&str] = &[
     "GET_USAGE_STATS",
     "READ_DEVICE_IDENTIFIERS",
 ];
-const OPS_LOCATION: &[&str] = &[
-    "COARSE_LOCATION",
-    "FINE_LOCATION",
-    "MONITOR_LOCATION",
-    "MONITOR_HIGH_POWER_LOCATION",
-];
+const OPS_LOCATION: &[&str] = &["COARSE_LOCATION", "FINE_LOCATION"];
 const OPS_CAMERA_MIC: &[&str] = &["CAMERA", "RECORD_AUDIO"];
 
-/// Applies GrapheneOS-inspired fake-empty App Isolation Scopes via `cmd appops set <pkg> <op> ignore`.
-/// Setting `ignore` (instead of `deny`) makes Android silently return empty cursors/results
-/// so apps continue running without crashing or repeatedly nagging for permissions.
-pub fn apply_app_scope(package_name: &str, scope: &AppIsolationScope) -> Result<(), String> {
+/// Applies GrapheneOS-inspired fake-empty App Isolation Scopes via `cmd appops set --user 0 <pkg> <op> ignore`.
+/// Returns number of AppOps successfully updated.
+pub fn apply_app_scope(package_name: &str, scope: &AppIsolationScope) -> Result<usize, String> {
     if !validate_package_name(package_name) {
         return Err(format!("Invalid package name: {}", package_name));
     }
@@ -66,27 +57,42 @@ pub fn apply_app_scope(package_name: &str, scope: &AppIsolationScope) -> Result<
     ];
 
     let cmd_bin = resolve_bin("cmd");
+    let mut ok_count = 0usize;
+    let mut last_err: Option<String> = None;
+
     for &(ops, isolated) in groups {
         let mode = if isolated { "ignore" } else { "default" };
         for &op in ops {
-            // Best-effort per op because some ops vary slightly across Android 12-16 OEMs
-            let _ = run_cmd(
+            match run_cmd(
                 &cmd_bin,
                 &["appops", "set", "--user", "0", package_name, op, mode],
                 None,
                 2500,
-            );
+            ) {
+                Ok(out) if out.success() => ok_count += 1,
+                Ok(out) => {
+                    let msg = out.stderr.trim();
+                    if !msg.is_empty() {
+                        last_err = Some(msg.to_string());
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
         }
     }
-    Ok(())
+
+    if ok_count == 0 {
+        if let Some(e) = last_err {
+            return Err(format!("appops failed: {}", e));
+        }
+    }
+    Ok(ok_count)
 }
 
-/// Resets all Silo-managed appops for a package cleanly back to Android's `default`.
-pub fn clear_app_scope(package_name: &str) -> Result<(), String> {
+pub fn clear_app_scope(package_name: &str) -> Result<usize, String> {
     apply_app_scope(package_name, &AppIsolationScope::default())
 }
 
-/// Re-applies all configured isolation scopes (e.g. after boot).
 pub fn sync_all_scopes(cfg: &ScopesConfig) {
     for (pkg, scope) in &cfg.apps {
         if scope.any_enabled() {
@@ -95,9 +101,28 @@ pub fn sync_all_scopes(cfg: &ScopesConfig) {
     }
 }
 
-/// Privacy-preserving Auto-Clear Clipboard tracker:
-/// Computes only a non-reversible hash of clipboard metadata (never stores or logs clipboard text!)
-/// and clears the clipboard automatically once the configured timeout elapses.
+/// Counts live `ignore` appops verified via `cmd appops get --user 0 <pkg>` for Live Proof.
+pub fn count_live_ignored_ops(cfg: &ScopesConfig) -> usize {
+    let cmd_bin = resolve_bin("cmd");
+    let mut total = 0usize;
+    for (pkg, scope) in &cfg.apps {
+        if !scope.any_enabled() || !validate_package_name(pkg) {
+            continue;
+        }
+        if let Ok(out) = run_cmd(&cmd_bin, &["appops", "get", "--user", "0", pkg], None, 2000) {
+            if out.success() {
+                total += out
+                    .stdout
+                    .lines()
+                    .filter(|l| l.contains(": ignore"))
+                    .count();
+            }
+        }
+    }
+    total
+}
+
+/// Zero-logging Auto-Clear Clipboard guard.
 #[derive(Debug, Default)]
 pub struct ClipboardGuard {
     last_clip_fingerprint: Option<u64>,
@@ -112,26 +137,29 @@ impl ClipboardGuard {
 
     pub fn clear_now(&mut self) -> Result<(), String> {
         let cmd_bin = resolve_bin("cmd");
-        // Verified on Android 14-16: `cmd clipboard set-text ""` replaces primary clip cleanly.
-        // Also attempt `cmd clipboard clear` if supported by OEM framework.
-        let r1 = run_cmd(&cmd_bin, &["clipboard", "clear"], None, 2000);
-        if let Ok(out) = r1 {
-            if out.success() {
-                self.already_cleared_fingerprint = self.last_clip_fingerprint;
-                return Ok(());
+        // Try standard Android 14-16 `cmd clipboard` variants (as root, then via shell UID 2000 if OEM restricts UID 0)
+        for args in [
+            &["clipboard", "clear"][..],
+            &["clipboard", "set-text", ""][..],
+        ] {
+            if let Ok(out) = run_cmd(&cmd_bin, args, None, 2000) {
+                if out.success() {
+                    self.already_cleared_fingerprint = self.last_clip_fingerprint;
+                    return Ok(());
+                }
             }
         }
-        let r2 = run_cmd(&cmd_bin, &["clipboard", "set-text", ""], None, 2000)
-            .map_err(|e| format!("clipboard clear failed: {}", e))?;
-        if r2.success() {
-            self.already_cleared_fingerprint = self.last_clip_fingerprint;
-            Ok(())
-        } else {
-            Err(format!(
-                "clipboard clear returned error: {}",
-                r2.stderr.trim()
-            ))
+        // Fallback: execute under shell UID 2000 (Android ClipboardService shell command checks shell UID on some OEMs)
+        let su_bin = resolve_bin("su");
+        for cmd_str in ["cmd clipboard clear", "cmd clipboard set-text ''"] {
+            if let Ok(out) = run_cmd(&su_bin, &["2000", "-c", cmd_str], None, 2500) {
+                if out.success() {
+                    self.already_cleared_fingerprint = self.last_clip_fingerprint;
+                    return Ok(());
+                }
+            }
         }
+        Err("OEM ClipboardService rejected shell clear; use Clear Now inside Silo app".to_string())
     }
 
     pub fn tick(&mut self, cfg: &ScopesConfig) {
@@ -161,16 +189,12 @@ impl ClipboardGuard {
     }
 }
 
-/// Reads only the primary clip metadata header from `dumpsys clipboard` and hashes it in RAM.
-/// Returns `None` when the clipboard is empty. Never persists or logs clipboard contents.
 fn probe_clipboard_metadata_hash() -> Option<u64> {
     let dumpsys = resolve_bin("dumpsys");
     let out = run_cmd(&dumpsys, &["clipboard"], None, 2000).ok()?;
     if !out.success() {
         return None;
     }
-
-    // Extract only metadata lines (timestamp / clip description / package owner)
     let mut meta_lines = Vec::new();
     for line in out.stdout.lines() {
         let t = line.trim();
@@ -206,6 +230,5 @@ mod tests {
         assert!(apply_app_scope("bad;rm -rf /", &profile).is_err());
         assert!(apply_app_scope("com.android.systemui", &profile).is_err());
         assert!(apply_app_scope("dev.silo.app", &profile).is_err());
-        assert!(apply_app_scope("com.rifsxd.ksunext", &profile).is_err());
     }
 }

@@ -1,13 +1,9 @@
-use crate::config::{AutomationConfig, MIN_AUTO_REBOOT_MINUTES};
-use crate::protocol::ActiveInterfaces;
+use crate::config::{validate_hostname, AutomationConfig, MIN_AUTO_REBOOT_MINUTES};
+use crate::protocol::{ActiveInterfaces, PrivateDnsState};
 use crate::sys::{boottime_secs, resolve_bin, run_cmd};
 
 pub const PANIC_REBOOT_CONFIRM_TOKEN: &str = "CONFIRM_SILO_BFU_REBOOT";
 
-/// Manages GrapheneOS-inspired runtime privacy automation:
-/// 1. Auto-Reboot to BFU (CLOCK_BOOTTIME monotonic lock timer, CE-unlock aware, >=15 min safety floor)
-/// 2. Wi-Fi & Bluetooth idle auto-off
-/// 3. Global Camera/Mic Hardware Sensors Kill-Switch (`cmd sensor_privacy`)
 #[derive(Debug, Default)]
 pub struct AutomationEngine {
     locked_since_boottime: Option<u64>,
@@ -23,7 +19,7 @@ impl AutomationEngine {
     }
 
     pub fn sensors_off_active(&self) -> bool {
-        self.sensors_off_manual || self.sensors_off_by_lock
+        self.sensors_off_manual || self.sensors_off_by_lock || probe_real_sensor_privacy_active()
     }
 
     pub fn set_sensors_off_manual(&mut self, enabled: bool) -> Result<(), String> {
@@ -35,7 +31,6 @@ impl AutomationEngine {
         Ok(())
     }
 
-    /// Computes remaining seconds before BFU auto-reboot, if armed.
     pub fn auto_reboot_remaining_secs(
         &self,
         cfg: &AutomationConfig,
@@ -51,7 +46,6 @@ impl AutomationEngine {
         Some(threshold_secs.saturating_sub(elapsed))
     }
 
-    /// Periodic tick called by daemon supervisor. Returns `true` if BFU auto-reboot threshold was reached.
     pub fn tick(
         &mut self,
         cfg: &AutomationConfig,
@@ -80,7 +74,7 @@ impl AutomationEngine {
             self.sensors_off_by_lock = false;
         }
 
-        // 2. Wi-Fi Auto-Off when enabled but disconnected
+        // 2. Wi-Fi Auto-Off when idle
         if cfg.wifi_auto_off_enabled {
             if ifaces.wifi.is_empty() && is_wifi_radio_enabled() {
                 let since = *self.wifi_idle_since.get_or_insert(now);
@@ -96,7 +90,7 @@ impl AutomationEngine {
             self.wifi_idle_since = None;
         }
 
-        // 3. Bluetooth Auto-Off when enabled but no active profile connection
+        // 3. Bluetooth Auto-Off when idle
         if cfg.bluetooth_auto_off_enabled {
             if is_bt_enabled_and_idle() {
                 let since = *self.bt_idle_since.get_or_insert(now);
@@ -112,9 +106,7 @@ impl AutomationEngine {
             self.bt_idle_since = None;
         }
 
-        // 4. GrapheneOS-inspired Auto-Reboot to BFU Timer
-        // CRITICAL INVARIANT: Only arm when CE storage is unlocked (prevents rebooting while already in BFU!)
-        // and device is currently locked, with hard floor >= 15 minutes.
+        // 4. GrapheneOS-style Auto-Reboot to BFU (CE-unlock aware, CLOCK_BOOTTIME, >=15m floor)
         if cfg.auto_reboot_enabled && ce_unlocked && device_locked {
             let locked_since = *self.locked_since_boottime.get_or_insert(now);
             let threshold_secs =
@@ -130,8 +122,79 @@ impl AutomationEngine {
     }
 }
 
+/// Reads actual Android Private DNS (DoT) settings directly from Settings Global.
+pub fn get_private_dns() -> PrivateDnsState {
+    let settings = resolve_bin("settings");
+    let mode = run_cmd(&settings, &["get", "global", "private_dns_mode"], None, 1500)
+        .ok()
+        .filter(|o| o.success())
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "null")
+        .unwrap_or_else(|| "opportunistic".to_string());
+
+    let specifier = run_cmd(
+        &settings,
+        &["get", "global", "private_dns_specifier"],
+        None,
+        1500,
+    )
+    .ok()
+    .filter(|o| o.success())
+    .map(|o| o.stdout.trim().to_string())
+    .filter(|s| !s.is_empty() && s != "null")
+    .unwrap_or_default();
+
+    PrivateDnsState { mode, specifier }
+}
+
+/// Sets Android's native system Private DNS (DoT) cleanly with strict hostname validation.
+pub fn set_private_dns(mode: &str, specifier: &str) -> Result<PrivateDnsState, String> {
+    let clean_mode = match mode.trim() {
+        "off" => "off",
+        "opportunistic" => "opportunistic",
+        "hostname" => "hostname",
+        other => return Err(format!("Unsupported Private DNS mode: {}", other)),
+    };
+
+    let settings = resolve_bin("settings");
+    if clean_mode == "hostname" {
+        let host = specifier.trim();
+        if !validate_hostname(host) {
+            return Err(format!("Invalid DoT hostname: {}", host));
+        }
+        let r1 = run_cmd(
+            &settings,
+            &["put", "global", "private_dns_specifier", host],
+            None,
+            2500,
+        )
+        .map_err(|e| format!("settings put specifier failed: {}", e))?;
+        if !r1.success() {
+            return Err(format!(
+                "Failed to set private_dns_specifier: {}",
+                r1.stderr.trim()
+            ));
+        }
+    }
+
+    let r2 = run_cmd(
+        &settings,
+        &["put", "global", "private_dns_mode", clean_mode],
+        None,
+        2500,
+    )
+    .map_err(|e| format!("settings put mode failed: {}", e))?;
+    if !r2.success() {
+        return Err(format!(
+            "Failed to set private_dns_mode: {}",
+            r2.stderr.trim()
+        ));
+    }
+
+    Ok(get_private_dns())
+}
+
 /// Official Android 12-16 `cmd sensor_privacy` toggle for global hardware microphone & camera mute.
-/// Never touches undocumented settings keys.
 pub fn apply_sensor_privacy(enable_privacy_off: bool) -> Result<(), String> {
     let cmd_bin = resolve_bin("cmd");
     let action = if enable_privacy_off {
@@ -144,8 +207,7 @@ pub fn apply_sensor_privacy(enable_privacy_off: bool) -> Result<(), String> {
 
     match (r_mic, r_cam) {
         (Ok(m), Ok(c)) if m.success() || c.success() => Ok(()),
-        (Err(e), _) => Err(format!("sensor_privacy exec error: {}", e)),
-        (_, Err(e)) => Err(format!("sensor_privacy exec error: {}", e)),
+        (Err(e), _) | (_, Err(e)) => Err(format!("sensor_privacy exec error: {}", e)),
         (Ok(m), Ok(c)) => Err(format!(
             "sensor_privacy failed: mic={} cam={}",
             m.stderr.trim(),
@@ -154,7 +216,21 @@ pub fn apply_sensor_privacy(enable_privacy_off: bool) -> Result<(), String> {
     }
 }
 
-/// Executes a clean Android reboot back into BFU (Before First Unlock) encrypted state.
+/// Reads actual hardware sensor_privacy state from `dumpsys sensor_privacy`.
+pub fn probe_real_sensor_privacy_active() -> bool {
+    let dumpsys = resolve_bin("dumpsys");
+    let Ok(out) = run_cmd(&dumpsys, &["sensor_privacy"], None, 1500) else {
+        return false;
+    };
+    if !out.success() {
+        return false;
+    }
+    out.stdout.lines().any(|l| {
+        let t = l.trim();
+        t.contains("state_type=1") || t.contains("is_enabled=true")
+    })
+}
+
 pub fn execute_clean_bfu_reboot() -> Result<(), String> {
     let svc = resolve_bin("svc");
     if let Ok(out) = run_cmd(&svc, &["power", "reboot"], None, 5000) {
@@ -193,7 +269,7 @@ fn is_bt_enabled_and_idle() -> bool {
             let t = line.trim();
             if t.contains("ConnectionState: STATE_CONNECTED")
                 || t.contains("mConnectionState=2")
-                || t.contains("Connected devices:") && !t.ends_with("0")
+                || (t.contains("Connected devices:") && !t.ends_with('0'))
             {
                 return false;
             }
@@ -216,20 +292,13 @@ mod tests {
         };
         let ifaces = ActiveInterfaces::default();
 
-        // Already in BFU (ce_unlocked = false): must NOT arm!
         assert!(!eng.tick(&cfg, false, true, &ifaces));
         assert!(eng.auto_reboot_remaining_secs(&cfg, false, true).is_none());
-
-        // Unlocked (device_locked = false): must NOT arm!
         assert!(!eng.tick(&cfg, true, false, &ifaces));
         assert!(eng.auto_reboot_remaining_secs(&cfg, true, false).is_none());
-
-        // Locked after CE unlock: arms with ~900s remaining
         assert!(!eng.tick(&cfg, true, true, &ifaces));
         let rem = eng.auto_reboot_remaining_secs(&cfg, true, true).unwrap();
         assert!((895..=900).contains(&rem));
-
-        // Unlocking immediately clears countdown
         assert!(!eng.tick(&cfg, true, false, &ifaces));
         assert!(eng.locked_since_boottime.is_none());
     }

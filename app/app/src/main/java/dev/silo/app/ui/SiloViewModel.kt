@@ -5,9 +5,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.silo.app.SiloApp
-import dev.silo.app.data.AppInventory
-import dev.silo.app.data.BlocklistParser
-import dev.silo.app.data.InstalledApp
+import dev.silo.app.data.*
 import dev.silo.app.ipc.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,14 +30,22 @@ data class SiloUiState(
     val freezerStatus: FreezerStatus = FreezerStatus(),
     val hardeningStatus: HardeningStatus = HardeningStatus(),
     val sentinelReport: SentinelReport? = null,
+    val liveProof: LiveProofReport? = null,
     val disguiseEnabled: Boolean = false,
+    val languagePref: AppLanguagePref = AppLanguagePref.SYSTEM,
+    val themePref: AppThemePref = AppThemePref.OBSIDIAN,
     val snackbarMessage: String? = null,
     val monitorAutoRefresh: Boolean = true,
 )
 
 class SiloViewModel(application: Application) : AndroidViewModel(application) {
     private val repo = (application as SiloApp).repository
-    private val _ui = MutableStateFlow(SiloUiState())
+    private val _ui = MutableStateFlow(
+        SiloUiState(
+            languagePref = repo.getLanguagePref(application),
+            themePref = repo.getThemePref(application),
+        )
+    )
     val ui: StateFlow<SiloUiState> = _ui.asStateFlow()
 
     private var monitorJob: Job? = null
@@ -54,6 +60,16 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun toast(msg: String) {
         _ui.update { it.copy(snackbarMessage = msg) }
+    }
+
+    fun setLanguage(pref: AppLanguagePref) {
+        repo.setLanguagePref(getApplication(), pref)
+        _ui.update { it.copy(languagePref = pref) }
+    }
+
+    fun setTheme(pref: AppThemePref) {
+        repo.setThemePref(getApplication(), pref)
+        _ui.update { it.copy(themePref = pref) }
     }
 
     fun refreshAll() {
@@ -142,9 +158,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
             repo.applyPreset(preset).onSuccess { newCfg ->
                 _ui.update { it.copy(config = newCfg) }
                 refreshLightStatus()
-                toast("Preset ${preset.name} applied")
+                toast("Preset ${preset.name.lowercase()} diterapkan")
             }.onFailure { e ->
-                toast("Preset failed: ${e.message}")
+                toast("Gagal menerapkan preset: ${e.message}")
             }
         }
     }
@@ -156,7 +172,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 _ui.update { it.copy(config = it.config.copy(firewall = saved)) }
                 refreshLightStatus()
             }.onFailure { e ->
-                toast("Firewall update failed: ${e.message}")
+                toast("Firewall error: ${e.message}")
             }
         }
     }
@@ -186,7 +202,29 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 refreshLightStatus()
             }.onFailure { e ->
-                toast("Remove rule failed: ${e.message}")
+                toast("Reset error: ${e.message}")
+            }
+        }
+    }
+
+    fun setTempUnblock(uid: Int, durationMinutes: Int) {
+        viewModelScope.launch {
+            repo.setTempUnblock(uid, durationMinutes).onSuccess {
+                refreshLightStatus()
+                toast("Temporary internet granted (${durationMinutes}m)")
+            }.onFailure { e ->
+                toast("Temp unblock failed: ${e.message}")
+            }
+        }
+    }
+
+    fun clearTempUnblock(uid: Int) {
+        viewModelScope.launch {
+            repo.clearTempUnblock(uid).onSuccess {
+                refreshLightStatus()
+                toast("Temporary access revoked & TCP cut")
+            }.onFailure { e ->
+                toast("Revoke failed: ${e.message}")
             }
         }
     }
@@ -200,21 +238,21 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 }.getOrNull()
             }
             if (raw == null) {
-                toast("Could not read selected blocklist file")
+                toast("File tidak dapat dibaca")
                 return@launch
             }
             val parsed = BlocklistParser.parseLines(raw)
             if (parsed.isEmpty()) {
-                toast("No valid IPv4/IPv6/CIDR entries found in file")
+                toast("Tidak ditemukan IP/CIDR valid di file")
                 return@launch
             }
             repo.replaceIpBlocklist(parsed).onSuccess { obj ->
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Blocklist synced: ${obj["loaded"]} entries (${obj["backend"]})")
+                toast("Blocklist aktif: ${obj["loaded"]} entri (${obj["backend"]})")
             }.onFailure { e ->
-                toast("Blocklist apply failed: ${e.message}")
+                toast("Blocklist error: ${e.message}")
             }
         }
     }
@@ -222,7 +260,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun addSingleBlocklistCidr(cidr: String) {
         val cleaned = BlocklistParser.parseLines(cidr)
         if (cleaned.isEmpty()) {
-            toast("Invalid IP/CIDR syntax")
+            toast("Format IP/CIDR tidak valid")
             return
         }
         val merged = (_ui.value.config.firewall.ipBlocklist + cleaned).distinct()
@@ -231,9 +269,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Added ${cleaned.first()} to kernel blocklist")
+                toast("Ditambahkan: ${cleaned.first()}")
             }.onFailure { e ->
-                toast("Failed: ${e.message}")
+                toast("Gagal: ${e.message}")
             }
         }
     }
@@ -244,9 +282,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 val cfg = repo.getConfig().getOrDefault(_ui.value.config)
                 _ui.update { it.copy(config = cfg) }
                 refreshLightStatus()
-                toast("Kernel IP blocklist cleared")
+                toast("Blocklist IP dikosongkan")
             }.onFailure { e ->
-                toast("Clear failed: ${e.message}")
+                toast("Gagal: ${e.message}")
             }
         }
     }
@@ -255,9 +293,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.emergencyFlushFirewall().onSuccess {
                 refreshAll()
-                toast("Emergency flush complete — all SILO_* chains cleared")
+                toast("Semua aturan SILO_* di kernel telah dibersihkan")
             }.onFailure { e ->
-                toast("Flush failed: ${e.message}")
+                toast("Flush gagal: ${e.message}")
             }
         }
     }
@@ -266,9 +304,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.killUidSockets(uid).onSuccess { killed ->
                 refreshMonitorOnce()
-                toast("SOCK_DESTROY closed $killed active TCP socket(s)")
+                toast("SOCK_DESTROY memutus $killed soket TCP aktif")
             }.onFailure { e ->
-                toast("Kill failed: ${e.message}")
+                toast("Gagal memutus soket: ${e.message}")
             }
         }
     }
@@ -277,9 +315,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.killConnection(conn).onSuccess { killed ->
                 refreshMonitorOnce()
-                toast("Terminated $killed socket(s)")
+                toast("Memutus $killed soket TCP")
             }.onFailure { e ->
-                toast("Terminate failed: ${e.message}")
+                toast("Gagal memutus: ${e.message}")
             }
         }
     }
@@ -288,7 +326,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.clearTelemetry().onSuccess {
                 _ui.update { it.copy(telemetry = TelemetrySnapshot()) }
-                toast("RAM telemetry ring cleared")
+                toast("Log RAM dibersihkan")
             }
         }
     }
@@ -309,7 +347,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 refreshLightStatus()
             }.onFailure { e ->
-                toast("Freezer toggle failed: ${e.message}")
+                toast("Freezer error: ${e.message}")
             }
         }
     }
@@ -351,9 +389,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
             repo.freezeUidNow(uid).onSuccess { fs ->
                 _ui.update { it.copy(freezerStatus = fs) }
                 refreshLightStatus()
-                toast("UID $uid frozen in kernel cgroup v2")
+                toast(fs.lastActionDetail ?: "UID $uid dibekukan")
             }.onFailure { e ->
-                toast("Freeze failed: ${e.message}")
+                toast("Freeze gagal: ${e.message}")
             }
         }
     }
@@ -363,9 +401,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
             repo.thawUidNow(uid).onSuccess { fs ->
                 _ui.update { it.copy(freezerStatus = fs) }
                 refreshLightStatus()
-                toast("UID $uid thawed immediately")
+                toast("UID $uid dicairkan")
             }.onFailure { e ->
-                toast("Thaw failed: ${e.message}")
+                toast("Thaw gagal: ${e.message}")
             }
         }
     }
@@ -375,7 +413,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
             repo.thawAllNow().onSuccess { fs ->
                 _ui.update { it.copy(freezerStatus = fs) }
                 refreshLightStatus()
-                toast("All frozen apps thawed")
+                toast("Semua aplikasi beku & suspend dicairkan")
             }
         }
     }
@@ -389,7 +427,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                     cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
                 }
             }.onFailure { e ->
-                toast("Scope update failed: ${e.message}")
+                toast("Scope gagal: ${e.message}")
             }
         }
     }
@@ -402,9 +440,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                     next[packageName] = profile
                     cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
                 }
-                toast("Hardened Isolation Profile applied to $packageName")
+                toast("Isolasi penuh diterapkan ke $packageName")
             }.onFailure { e ->
-                toast("Profile error: ${e.message}")
+                toast("Gagal: ${e.message}")
             }
         }
     }
@@ -417,7 +455,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                     next.remove(packageName)
                     cur.copy(config = cur.config.copy(scopes = cur.config.scopes.copy(apps = next)))
                 }
-                toast("Scopes reset to default for $packageName")
+                toast("Isolasi direset untuk $packageName")
             }
         }
     }
@@ -427,16 +465,20 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
             repo.setAutoClearClipboard(enabled, clearSecs).onSuccess { saved ->
                 _ui.update { it.copy(config = it.config.copy(scopes = saved)) }
             }.onFailure { e ->
-                toast("Clipboard config error: ${e.message}")
+                toast("Clipboard error: ${e.message}")
             }
         }
     }
 
+    /** Uses native Android ClipboardManager FIRST (guaranteed on One UI 7), plus daemon fallback. */
     fun clearClipboardNow() {
+        val nativeOk = repo.clearClipboardNative(getApplication())
         viewModelScope.launch {
-            repo.clearClipboardNow()
-                .onSuccess { toast("Clipboard cleared") }
-                .onFailure { e -> toast("Clipboard clear failed: ${e.message}") }
+            val daemonOk = repo.clearClipboardNow().isSuccess
+            toast(
+                if (nativeOk || daemonOk) "Clipboard berhasil dihapus"
+                else "Clipboard gagal dihapus"
+            )
         }
     }
 
@@ -465,9 +507,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                         config = it.config.copy(hardening = it.config.hardening.copy(enabled = false)),
                     )
                 }
-                toast("All sysctl values rolled back to pre-Silo snapshot")
+                toast("Semua parameter sysctl dikembalikan ke default")
             }.onFailure { e ->
-                toast("Rollback error: ${e.message}")
+                toast("Rollback gagal: ${e.message}")
             }
         }
     }
@@ -479,7 +521,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 _ui.update { it.copy(config = it.config.copy(automation = saved)) }
                 refreshLightStatus()
             }.onFailure { e ->
-                toast("Automation update failed: ${e.message}")
+                toast("Otomasi gagal: ${e.message}")
             }
         }
     }
@@ -488,9 +530,21 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.setSensorsOff(enabled).onSuccess { active ->
                 _ui.update { it.copy(status = it.status.copy(sensorsOffActive = active)) }
-                toast(if (active) "Global Mic/Cam sensors muted" else "Global Mic/Cam sensors restored")
+                toast(if (active) "Sensor mikrofon & kamera dimatikan" else "Sensor dipulihkan")
             }.onFailure { e ->
-                toast("Sensors toggle failed: ${e.message}")
+                toast("Sensor toggle gagal: ${e.message}")
+            }
+        }
+    }
+
+    fun setPrivateDns(mode: String, specifier: String = "") {
+        viewModelScope.launch {
+            repo.setPrivateDns(mode, specifier).onSuccess { dns ->
+                _ui.update { it.copy(status = it.status.copy(privateDns = dns)) }
+                val label = if (dns.mode == "hostname") dns.specifier else dns.mode
+                toast("Private DNS: $label")
+            }.onFailure { e ->
+                toast("Private DNS gagal: ${e.message}")
             }
         }
     }
@@ -498,7 +552,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
     fun triggerPanicReboot() {
         viewModelScope.launch {
             repo.triggerPanicReboot().onFailure { e ->
-                toast("Panic reboot failed: ${e.message}")
+                toast("Panic reboot gagal: ${e.message}")
             }
         }
     }
@@ -507,9 +561,19 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repo.runSentinelAudit().onSuccess { report ->
                 _ui.update { it.copy(sentinelReport = report) }
-                toast("Sentinel audit complete: Score ${report.score}/100")
             }.onFailure { e ->
-                toast("Audit failed: ${e.message}")
+                toast("Audit gagal: ${e.message}")
+            }
+        }
+    }
+
+    fun runLiveProof(onDone: (() -> Unit)? = null) {
+        viewModelScope.launch {
+            repo.runLiveProof().onSuccess { proof ->
+                _ui.update { it.copy(liveProof = proof) }
+                onDone?.invoke()
+            }.onFailure { e ->
+                toast("Live Proof gagal: ${e.message}")
             }
         }
     }
@@ -524,9 +588,9 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }.isSuccess
                 }
-                toast(if (ok) "Backup exported cleanly" else "Failed to write backup file")
+                toast(if (ok) "Backup berhasil diekspor" else "Gagal menulis file backup")
             }.onFailure { e ->
-                toast("Export failed: ${e.message}")
+                toast("Ekspor gagal: ${e.message}")
             }
         }
     }
@@ -540,14 +604,14 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
                 }.getOrNull()
             }
             if (raw == null) {
-                toast("Could not read backup file")
+                toast("File backup tidak bisa dibaca")
                 return@launch
             }
             repo.importConfigJson(raw).onSuccess {
                 refreshAll()
-                toast("Configuration imported and applied")
+                toast("Konfigurasi berhasil diimpor")
             }.onFailure { e ->
-                toast("Import failed: ${e.message}")
+                toast("Impor gagal: ${e.message}")
             }
         }
     }
@@ -556,7 +620,7 @@ class SiloViewModel(application: Application) : AndroidViewModel(application) {
         val ctx = getApplication<Application>()
         repo.setDisguiseEnabled(ctx, enabled)
         _ui.update { it.copy(disguiseEnabled = enabled) }
-        toast(if (enabled) "Launcher disguised as NetDiag" else "Launcher restored to Silo")
+        toast(if (enabled) "Launcher disamarkan sebagai NetDiag" else "Launcher dikembalikan ke Silo")
     }
 
     private suspend fun refreshLightStatus() {

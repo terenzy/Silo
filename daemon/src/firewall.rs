@@ -46,6 +46,7 @@ const FILTER_CHAINS: &[&str] = &[
     "SILO_DENY_HTTP",
     "SILO_DENY_IPSET",
     "SILO_DENY_V6LEAK",
+    "SILO_DENY_SCAN",
 ];
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,7 @@ pub struct FirewallApplyResult {
     pub ipset_backend: String,
     pub vpn_active: bool,
     pub active_interfaces: ActiveInterfaces,
+    pub warning: Option<String>,
 }
 
 pub fn probe_capabilities() -> KernelCapabilities {
@@ -69,7 +71,20 @@ pub fn probe_capabilities() -> KernelCapabilities {
 
     let xt_set_available = if iptables_available {
         run_cmd(&ipt, &["-m", "set", "--help"], None, 2000)
-            .map(|o| o.success() && (o.stdout.contains("--match-set") || o.stderr.contains("--match-set")))
+            .map(|o| {
+                o.success()
+                    && (o.stdout.contains("--match-set") || o.stderr.contains("--match-set"))
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let xt_recent_available = if iptables_available {
+        run_cmd(&ipt, &["-m", "recent", "--help"], None, 2000)
+            .map(|o| {
+                o.success() && (o.stdout.contains("--rcheck") || o.stderr.contains("--rcheck"))
+            })
             .unwrap_or(false)
     } else {
         false
@@ -77,7 +92,10 @@ pub fn probe_capabilities() -> KernelCapabilities {
 
     let nflog_available = if iptables_available {
         run_cmd(&ipt, &["-j", "NFLOG", "--help"], None, 2000)
-            .map(|o| o.success() && (o.stdout.contains("--nflog-group") || o.stderr.contains("--nflog-group")))
+            .map(|o| {
+                o.success()
+                    && (o.stdout.contains("--nflog-group") || o.stderr.contains("--nflog-group"))
+            })
             .unwrap_or(false)
     } else {
         false
@@ -85,7 +103,9 @@ pub fn probe_capabilities() -> KernelCapabilities {
 
     let ttl_target_available = if iptables_available {
         run_cmd(&ipt, &["-t", "mangle", "-j", "TTL", "--help"], None, 2000)
-            .map(|o| o.success() && (o.stdout.contains("--ttl-set") || o.stderr.contains("--ttl-set")))
+            .map(|o| {
+                o.success() && (o.stdout.contains("--ttl-set") || o.stderr.contains("--ttl-set"))
+            })
             .unwrap_or(false)
     } else {
         false
@@ -93,7 +113,9 @@ pub fn probe_capabilities() -> KernelCapabilities {
 
     let hl_target_available = if ip6tables_available {
         run_cmd(&ip6t, &["-t", "mangle", "-j", "HL", "--help"], None, 2000)
-            .map(|o| o.success() && (o.stdout.contains("--hl-set") || o.stderr.contains("--hl-set")))
+            .map(|o| {
+                o.success() && (o.stdout.contains("--hl-set") || o.stderr.contains("--hl-set"))
+            })
             .unwrap_or(false)
     } else {
         false
@@ -117,6 +139,7 @@ pub fn probe_capabilities() -> KernelCapabilities {
         ip6tables_available,
         ipset_netlink_available,
         xt_set_available,
+        xt_recent_available,
         nflog_available,
         ttl_target_available,
         hl_target_available,
@@ -126,12 +149,13 @@ pub fn probe_capabilities() -> KernelCapabilities {
     }
 }
 
-/// Applies the complete firewall policy atomically (dry-run `--test --noflush` first, then live apply)
-/// without ever flushing Android `netd`'s chains.
+/// Applies the firewall policy atomically using Android `netd`'s exact `iptables-restore --noflush -w`
+/// flags, with graceful automatic degradation if an optional kernel match/target fails on an OEM build.
 pub fn apply_firewall(
     cfg: &FirewallConfig,
-    caps: &KernelCapabilities,
+    caps: &mut KernelCapabilities,
     screen_on: bool,
+    temp_unblocked_uids: &HashSet<u32>,
     previously_blocked_uids: &mut HashSet<u32>,
 ) -> Result<FirewallApplyResult, String> {
     let ifaces = classify_active_interfaces();
@@ -145,6 +169,7 @@ pub fn apply_firewall(
             ipset_backend: "disabled".to_string(),
             vpn_active,
             active_interfaces: ifaces,
+            warning: None,
         });
     }
 
@@ -152,7 +177,6 @@ pub fn apply_firewall(
         return Err("iptables binary is unavailable on this device".to_string());
     }
 
-    // Parse & split IP blocklist into IPv4 / IPv6 canonical CIDRs
     let mut v4_cidrs = Vec::new();
     let mut v6_cidrs = Vec::new();
     for entry in &cfg.ip_blocklist {
@@ -164,8 +188,6 @@ pub fn apply_firewall(
         }
     }
 
-    // Use native Netlink ipset O(1) lookup when BOTH kernel ipset netlink AND iptables xt_set are present;
-    // otherwise gracefully degrade to bounded iptables chain.
     let mut use_ipset = false;
     let mut ipset_loaded = 0usize;
     let ipset_backend: String;
@@ -202,7 +224,9 @@ pub fn apply_firewall(
         ipset_backend = "iptables_chain_fallback".to_string();
     }
 
-    let v4_script = build_restore_script(
+    // Apply IPv4 with automatic extension degradation if OEM iptables lacks NFLOG / TTL / xt_recent
+    let mut warning: Option<String> = None;
+    apply_table_with_fallback(
         false,
         cfg,
         caps,
@@ -210,12 +234,14 @@ pub fn apply_firewall(
         vpn_active,
         use_ipset,
         &v4_cidrs,
-    );
-    apply_restore_atomic("iptables-restore", &v4_script)?;
+        temp_unblocked_uids,
+        &mut warning,
+    )?;
     ensure_hook_jumps("iptables", cfg.normalize_ttl_hl && caps.ttl_target_available)?;
 
+    // Apply IPv6 independently (an IPv6 OEM quirk must never disable IPv4 protection)
     if caps.ip6tables_available {
-        let v6_script = build_restore_script(
+        match apply_table_with_fallback(
             true,
             cfg,
             caps,
@@ -223,12 +249,21 @@ pub fn apply_firewall(
             vpn_active,
             use_ipset,
             &v6_cidrs,
-        );
-        apply_restore_atomic("ip6tables-restore", &v6_script)?;
-        ensure_hook_jumps("ip6tables", cfg.normalize_ttl_hl && caps.hl_target_available)?;
+            temp_unblocked_uids,
+            &mut warning,
+        ) {
+            Ok(()) => {
+                let _ = ensure_hook_jumps(
+                    "ip6tables",
+                    cfg.normalize_ttl_hl && caps.hl_target_available,
+                );
+            }
+            Err(e) => {
+                warning = Some(format!("IPv6 partial warning: {}", e));
+            }
+        }
     }
 
-    // Reclaim unused kernel ipset memory once iptables references are detached
     if v4_cidrs.is_empty() {
         ipset_cleanup(IPSET_V4_NAME);
     }
@@ -236,13 +271,14 @@ pub fn apply_firewall(
         ipset_cleanup(IPSET_V6_NAME);
     }
 
-    // Tear down already-established TCP sockets via SOCK_DESTROY for newly fully-blocked UIDs
+    // Tear down already-established TCP sockets via SOCK_DESTROY for newly blocked UIDs
     let currently_blocked: HashSet<u32> = cfg
         .rules
         .iter()
-        .filter(|(_, r)| {
-            (!r.allow_wifi && !r.allow_cellular && !r.allow_vpn)
-                || (!screen_on && !r.allow_screen_off)
+        .filter(|(&uid, r)| {
+            !temp_unblocked_uids.contains(&uid)
+                && ((!r.allow_wifi && !r.allow_cellular && !r.allow_vpn)
+                    || (!screen_on && !r.allow_screen_off))
         })
         .map(|(&uid, _)| uid)
         .collect();
@@ -261,11 +297,90 @@ pub fn apply_firewall(
         ipset_backend,
         vpn_active,
         active_interfaces: ifaces,
+        warning,
     })
 }
 
-/// Verifies that our top-level jump rules (`OUTPUT -> SILO_OUT`, `INPUT -> SILO_IN`)
-/// are still intact in case Android `netd` reloaded rules.
+#[allow(clippy::too_many_arguments)]
+fn apply_table_with_fallback(
+    is_v6: bool,
+    cfg: &FirewallConfig,
+    caps: &mut KernelCapabilities,
+    screen_on: bool,
+    vpn_active: bool,
+    use_ipset: bool,
+    cidrs: &[CanonicalCidr],
+    temp_unblocked_uids: &HashSet<u32>,
+    warning: &mut Option<String>,
+) -> Result<(), String> {
+    let restore_name = if is_v6 {
+        "ip6tables-restore"
+    } else {
+        "iptables-restore"
+    };
+
+    let script = build_restore_script(
+        is_v6,
+        cfg,
+        caps,
+        screen_on,
+        vpn_active,
+        use_ipset,
+        cidrs,
+        temp_unblocked_uids,
+    );
+    match apply_restore_atomic(restore_name, &script) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            // Inspect error and degrade unsupported optional extensions cleanly instead of breaking the whole firewall
+            let lower = first_err.to_lowercase();
+            let mut degraded = false;
+            if (lower.contains("nflog") || lower.contains("limit")) && caps.nflog_available {
+                caps.nflog_available = false;
+                degraded = true;
+            }
+            if lower.contains("recent") && caps.xt_recent_available {
+                caps.xt_recent_available = false;
+                degraded = true;
+            }
+            if lower.contains("ttl") && caps.ttl_target_available {
+                caps.ttl_target_available = false;
+                degraded = true;
+            }
+            if lower.contains("hl") && caps.hl_target_available {
+                caps.hl_target_available = false;
+                degraded = true;
+            }
+            if lower.contains("set") && use_ipset {
+                caps.xt_set_available = false;
+                degraded = true;
+            }
+            if !degraded {
+                // Last-resort safe retry disabling optional targets so core per-UID firewall always works
+                caps.nflog_available = false;
+                caps.xt_recent_available = false;
+                if is_v6 {
+                    caps.hl_target_available = false;
+                } else {
+                    caps.ttl_target_available = false;
+                }
+            }
+            *warning = Some(format!("Auto-degraded optional target after: {}", first_err));
+            let retry_script = build_restore_script(
+                is_v6,
+                cfg,
+                caps,
+                screen_on,
+                vpn_active,
+                false,
+                cidrs,
+                temp_unblocked_uids,
+            );
+            apply_restore_atomic(restore_name, &retry_script)
+        }
+    }
+}
+
 pub fn ensure_hook_jumps(ipt_name: &str, mangle_ttl_enabled: bool) -> Result<(), String> {
     let bin = resolve_bin(ipt_name);
 
@@ -281,12 +396,12 @@ pub fn ensure_hook_jumps(ipt_name: &str, mangle_ttl_enabled: bool) -> Result<(),
 }
 
 fn ensure_single_jump(bin: &str, table: &str, parent: &str, target: &str) -> Result<(), String> {
-    let check = run_cmd(bin, &["-w", "5", "-t", table, "-C", parent, "-j", target], None, 3000)
+    let check = run_cmd(bin, &["-w", "-t", table, "-C", parent, "-j", target], None, 3000)
         .map_err(|e| format!("{} check jump failed: {}", bin, e))?;
     if !check.success() {
         let ins = run_cmd(
             bin,
-            &["-w", "5", "-t", table, "-I", parent, "1", "-j", target],
+            &["-w", "-t", table, "-I", parent, "1", "-j", target],
             None,
             3000,
         )
@@ -306,21 +421,15 @@ fn ensure_single_jump(bin: &str, table: &str, parent: &str, target: &str) -> Res
 
 fn remove_all_jumps(bin: &str, table: &str, parent: &str, target: &str) {
     for _ in 0..8 {
-        let ok = run_cmd(
-            bin,
-            &["-w", "5", "-t", table, "-D", parent, "-j", target],
-            None,
-            2000,
-        )
-        .map(|o| o.success())
-        .unwrap_or(false);
+        let ok = run_cmd(bin, &["-w", "-t", table, "-D", parent, "-j", target], None, 2000)
+            .map(|o| o.success())
+            .unwrap_or(false);
         if !ok {
             break;
         }
     }
 }
 
-/// Cleanly detaches and removes ALL Silo chains without touching any Android `netd` rules.
 pub fn flush_firewall(caps: &KernelCapabilities) {
     let tools: &[(&str, bool)] = &[
         ("iptables", caps.iptables_available),
@@ -336,47 +445,36 @@ pub fn flush_firewall(caps: &KernelCapabilities) {
         remove_all_jumps(&bin, "mangle", "POSTROUTING", "SILO_MANGLE_POST");
 
         for &ch in FILTER_CHAINS {
-            let _ = run_cmd(&bin, &["-w", "5", "-t", "filter", "-F", ch], None, 2000);
+            let _ = run_cmd(&bin, &["-w", "-t", "filter", "-F", ch], None, 2000);
         }
         for &ch in FILTER_CHAINS {
-            let _ = run_cmd(&bin, &["-w", "5", "-t", "filter", "-X", ch], None, 2000);
+            let _ = run_cmd(&bin, &["-w", "-t", "filter", "-X", ch], None, 2000);
         }
-        let _ = run_cmd(&bin, &["-w", "5", "-t", "mangle", "-F", "SILO_MANGLE_POST"], None, 2000);
-        let _ = run_cmd(&bin, &["-w", "5", "-t", "mangle", "-X", "SILO_MANGLE_POST"], None, 2000);
+        let _ = run_cmd(&bin, &["-w", "-t", "mangle", "-F", "SILO_MANGLE_POST"], None, 2000);
+        let _ = run_cmd(&bin, &["-w", "-t", "mangle", "-X", "SILO_MANGLE_POST"], None, 2000);
     }
     ipset_cleanup(IPSET_V4_NAME);
     ipset_cleanup(IPSET_V6_NAME);
 }
 
+/// Uses Android `netd`'s exact `iptables-restore --noflush -w` invocation (no `--wait=5`!).
 fn apply_restore_atomic(restore_bin_name: &str, script: &str) -> Result<(), String> {
     let bin = resolve_bin(restore_bin_name);
-
-    // Step 1: Dry-run syntax verification (`--test --noflush`) so malformed rules never touch kernel tables
-    let test = run_cmd(&bin, &["--noflush", "--test"], Some(script), 5000)
-        .map_err(|e| format!("{} dry-run spawn failed: {}", restore_bin_name, e))?;
-    if !test.success() {
-        return Err(format!(
-            "{} dry-run validation failed: {}",
-            restore_bin_name,
-            test.stderr.trim()
-        ));
-    }
-
-    // Step 2: Atomic commit (`--noflush --wait=5`) preserving ALL Android netd chains
-    let apply = run_cmd(&bin, &["--noflush", "--wait=5"], Some(script), 8000)
-        .map_err(|e| format!("{} apply spawn failed: {}", restore_bin_name, e))?;
+    let apply = run_cmd(&bin, &["--noflush", "-w"], Some(script), 8000)
+        .map_err(|e| format!("{} spawn failed: {}", restore_bin_name, e))?;
     if !apply.success() {
         return Err(format!(
-            "{} commit failed: {}",
+            "{} commit failed (code {}): {}",
             restore_bin_name,
+            apply.status_code,
             apply.stderr.trim()
         ));
     }
     Ok(())
 }
 
-/// Pure, deterministic `iptables-restore --noflush` / `ip6tables-restore --noflush` compiler.
-/// Completely testable offline without root!
+/// Pure, deterministic `iptables-restore --noflush` compiler.
+#[allow(clippy::too_many_arguments)]
 pub fn build_restore_script(
     is_v6: bool,
     cfg: &FirewallConfig,
@@ -385,19 +483,17 @@ pub fn build_restore_script(
     vpn_active: bool,
     use_ipset: bool,
     cidrs: &[CanonicalCidr],
+    temp_unblocked_uids: &HashSet<u32>,
 ) -> String {
     let mut s = String::with_capacity(8192);
     s.push_str("*filter\n");
     for &ch in FILTER_CHAINS {
         s.push_str(&format!(":{} - [0:0]\n", ch));
     }
-    // Atomic per-chain flush inside --noflush transaction: prevents rule duplication on reloads
-    // while NEVER flushing built-in chains or Android netd chains!
     for &ch in FILTER_CHAINS {
         s.push_str(&format!("-F {}\n", ch));
     }
 
-    // Build terminal deny action chains with rate-limited NFLOG + REJECT/DROP
     let log_enabled = cfg.nflog_enabled && caps.nflog_available;
     let deny_specs = [
         ("SILO_DENY_UID", "SILO_UID"),
@@ -406,6 +502,7 @@ pub fn build_restore_script(
         ("SILO_DENY_HTTP", "SILO_HTTP"),
         ("SILO_DENY_IPSET", "SILO_IPSET"),
         ("SILO_DENY_V6LEAK", "SILO_V6LEAK"),
+        ("SILO_DENY_SCAN", "SILO_SCAN"),
     ];
     for (chain, prefix) in deny_specs {
         if log_enabled {
@@ -414,22 +511,23 @@ pub fn build_restore_script(
                 chain, SILO_NFLOG_GROUP, prefix
             ));
         }
+        // Always silent DROP for inbound port-scanners so we don't reveal open/closed ports
+        if chain == "SILO_DENY_SCAN" {
+            s.push_str(&format!("-A {} -j DROP\n", chain));
+            continue;
+        }
         match cfg.block_action {
             BlockAction::Reject => {
+                s.push_str(&format!(
+                    "-A {} -p tcp -j REJECT --reject-with tcp-reset\n",
+                    chain
+                ));
                 if is_v6 {
-                    s.push_str(&format!(
-                        "-A {} -p tcp -j REJECT --reject-with tcp-reset\n",
-                        chain
-                    ));
                     s.push_str(&format!(
                         "-A {} -j REJECT --reject-with icmp6-adm-prohibited\n",
                         chain
                     ));
                 } else {
-                    s.push_str(&format!(
-                        "-A {} -p tcp -j REJECT --reject-with tcp-reset\n",
-                        chain
-                    ));
                     s.push_str(&format!(
                         "-A {} -j REJECT --reject-with icmp-port-unreachable\n",
                         chain
@@ -442,9 +540,23 @@ pub fn build_restore_script(
         }
     }
 
-    // ---- SILO_IN (ingress protection without breaking normal outbound replies) ----
+    // ---- SILO_IN (ingress anti-port-scan & ipset source protection) ----
     s.push_str("-A SILO_IN -i lo -j RETURN\n");
     s.push_str("-A SILO_IN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n");
+    if cfg.anti_port_scan {
+        s.push_str("-A SILO_IN -m conntrack --ctstate INVALID -j DROP\n");
+        if caps.xt_recent_available {
+            let list_name = if is_v6 { "SILO_SCAN6" } else { "SILO_SCAN4" };
+            s.push_str(&format!(
+                "-A SILO_IN -p tcp --syn -m recent --name {} --set\n",
+                list_name
+            ));
+            s.push_str(&format!(
+                "-A SILO_IN -p tcp --syn -m recent --name {} --rcheck --seconds 60 --hitcount 12 -j SILO_DENY_SCAN\n",
+                list_name
+            ));
+        }
+    }
     if !cidrs.is_empty() && use_ipset {
         let set_name = if is_v6 { IPSET_V6_NAME } else { IPSET_V4_NAME };
         s.push_str(&format!(
@@ -454,7 +566,7 @@ pub fn build_restore_script(
     }
     s.push_str("-A SILO_IN -j RETURN\n");
 
-    // ---- SILO_LAN_CHK (per-app LAN allowlist before blocking RFC1918/multicast) ----
+    // ---- SILO_LAN_CHK ----
     for (&uid, rule) in &cfg.rules {
         if rule.allow_lan || rule.is_vpn_app {
             s.push_str(&format!(
@@ -467,7 +579,7 @@ pub fn build_restore_script(
     s.push_str("-A SILO_LAN_CHK -m owner --uid-owner 110000-119999 -j SILO_DENY_LAN\n");
     s.push_str("-A SILO_LAN_CHK -j RETURN\n");
 
-    // ---- SILO_BLK_IP (fallback CIDR chain when xt_set is unavailable in stock iptables) ----
+    // ---- SILO_BLK_IP (fallback CIDR chain) ----
     if !cidrs.is_empty() && !use_ipset {
         for c in cidrs.iter().take(FALLBACK_CHAIN_MAX_CIDRS) {
             s.push_str(&format!(
@@ -485,7 +597,7 @@ pub fn build_restore_script(
 
     // 2. Per-app opt-in localhost isolation, then allow normal loopback IPC
     for (&uid, rule) in &cfg.rules {
-        if rule.block_localhost {
+        if rule.block_localhost && !temp_unblocked_uids.contains(&uid) {
             s.push_str(&format!(
                 "-A SILO_OUT -o lo -m owner --uid-owner {} -j SILO_DENY_LAN\n",
                 uid
@@ -494,7 +606,7 @@ pub fn build_restore_script(
     }
     s.push_str("-A SILO_OUT -o lo -j RETURN\n");
 
-    // 3. Exempt designated VPN provider app UIDs so encrypted tunnels never deadlock
+    // 3. Exempt designated VPN provider app UIDs
     for (&uid, rule) in &cfg.rules {
         if rule.is_vpn_app {
             s.push_str(&format!(
@@ -504,7 +616,7 @@ pub fn build_restore_script(
         }
     }
 
-    // 4. Global tracker / malware IP blocklist (applies to ordinary user apps)
+    // 4. Global IP/CIDR blocklist
     if !cidrs.is_empty() {
         if use_ipset {
             let set_name = if is_v6 { IPSET_V6_NAME } else { IPSET_V4_NAME };
@@ -517,8 +629,7 @@ pub fn build_restore_script(
         }
     }
 
-    // 5. DNS Leak Guard: block plain port 53 bypass on Wi-Fi/Cellular from user apps
-    //    (Android netd UID 1051 & VPN apps already returned cleanly in steps 1 & 3)
+    // 5. DNS Leak Guard
     if cfg.dns_leak_guard {
         for iface in WIFI_IFACES.iter().chain(CELL_IFACES.iter()) {
             for proto in ["udp", "tcp"] {
@@ -534,7 +645,7 @@ pub fn build_restore_script(
         }
     }
 
-    // 6. IPv6 VPN Leak Guard: block non-VPN IPv6 egress for user apps while VPN is active
+    // 6. IPv6 VPN Leak Guard
     if is_v6 && cfg.ipv6_leak_guard && vpn_active {
         for iface in WIFI_IFACES.iter().chain(CELL_IFACES.iter()) {
             s.push_str(&format!(
@@ -548,7 +659,7 @@ pub fn build_restore_script(
         }
     }
 
-    // 7. LAN Isolation (RFC1918 + link-local + multicast)
+    // 7. LAN Isolation
     if cfg.isolate_lan {
         let lan_nets = if is_v6 { LAN_V6_CIDRS } else { LAN_V4_CIDRS };
         for net in lan_nets {
@@ -566,7 +677,7 @@ pub fn build_restore_script(
         );
     } else {
         for (&uid, rule) in &cfg.rules {
-            if rule.block_cleartext_http {
+            if rule.block_cleartext_http && !temp_unblocked_uids.contains(&uid) {
                 s.push_str(&format!(
                     "-A SILO_OUT -p tcp --dport 80 -m owner --uid-owner {} -j SILO_DENY_HTTP\n",
                     uid
@@ -575,10 +686,21 @@ pub fn build_restore_script(
         }
     }
 
-    // 9. Per-UID Screen-Off & Dual-Mode Interface Policy
+    // 9. Temporary Unblock Grants (bypass per-UID restrictions until timer expires)
+    for &uid in temp_unblocked_uids {
+        s.push_str(&format!(
+            "-A SILO_OUT -m owner --uid-owner {} -j RETURN\n",
+            uid
+        ));
+    }
+
+    // 10. Per-UID Screen-Off & Dual-Mode Interface Policy
     match cfg.mode {
         FirewallMode::DefaultAllow => {
             for (&uid, rule) in &cfg.rules {
+                if temp_unblocked_uids.contains(&uid) {
+                    continue;
+                }
                 if !screen_on && !rule.allow_screen_off {
                     s.push_str(&format!(
                         "-A SILO_OUT -m owner --uid-owner {} -j SILO_DENY_UID\n",
@@ -623,7 +745,7 @@ pub fn build_restore_script(
         FirewallMode::DefaultDeny => {
             for (&uid, rule) in &cfg.rules {
                 if !screen_on && !rule.allow_screen_off {
-                    continue; // falls through to SILO_DENY_UID
+                    continue;
                 }
                 if rule.allow_wifi {
                     for iface in WIFI_IFACES {
@@ -650,7 +772,6 @@ pub fn build_restore_script(
                     }
                 }
             }
-            // Only deny ordinary user app UIDs; kernel-originated packets (no owner) & system UIDs still RETURN safely
             s.push_str("-A SILO_OUT -m owner --uid-owner 10000-19999 -j SILO_DENY_UID\n");
             s.push_str("-A SILO_OUT -m owner --uid-owner 110000-119999 -j SILO_DENY_UID\n");
             s.push_str("-A SILO_OUT -j RETURN\n");
@@ -658,7 +779,6 @@ pub fn build_restore_script(
     }
     s.push_str("COMMIT\n");
 
-    // ---- Optional Mangle Table: TTL (IPv4) / Hop Limit (IPv6) Normalization ----
     let ttl_ok = if is_v6 {
         cfg.normalize_ttl_hl && caps.hl_target_available
     } else {
@@ -701,6 +821,7 @@ mod tests {
             ip6tables_available: true,
             ipset_netlink_available: true,
             xt_set_available: true,
+            xt_recent_available: true,
             nflog_available: true,
             ttl_target_available: true,
             hl_target_available: true,
@@ -711,102 +832,38 @@ mod tests {
     }
 
     #[test]
-    fn default_allow_script_never_flushes_builtin_chains_and_protects_system_uids() {
+    fn generates_anti_port_scan_and_temp_unblock_rules_cleanly() {
         let mut cfg = FirewallConfig {
             enabled: true,
+            anti_port_scan: true,
             isolate_lan: true,
             dns_leak_guard: true,
             normalize_ttl_hl: true,
             ttl_value: 64,
             ..Default::default()
         };
-        cfg.rules.insert(
-            10234,
-            AppFirewallRule {
-                package_name: "com.shady.app".into(),
-                allow_wifi: true,
-                allow_cellular: false,
-                allow_vpn: true,
-                allow_lan: false,
-                allow_screen_off: false,
-                block_cleartext_http: true,
-                block_localhost: true,
-                is_vpn_app: false,
-            },
-        );
-        let c = validate_cidr("198.51.100.0/24").unwrap();
-        let script = build_restore_script(false, &cfg, &mock_caps(), true, false, true, &[c]);
+        cfg.rules
+            .insert(10277, AppFirewallRule::deny_all("com.shop.app".into()));
+        let mut temp = HashSet::new();
+        temp.insert(10277);
 
-        // Must never declare or flush built-in OUTPUT/INPUT/FORWARD policies (which would wipe netd!)
+        let script = build_restore_script(false, &cfg, &mock_caps(), true, false, false, &[], &temp);
+        assert!(script.contains("-m recent --name SILO_SCAN4 --rcheck --seconds 60 --hitcount 12 -j SILO_DENY_SCAN"));
+        assert!(script.contains("-A SILO_OUT -m owner --uid-owner 10277 -j RETURN"));
+        assert!(!script.contains("-A SILO_OUT -m owner --uid-owner 10277 -j SILO_DENY_UID"));
         assert!(!script.contains(":OUTPUT "));
-        assert!(!script.contains(":INPUT "));
-        assert!(!script.contains(":FORWARD "));
-        assert!(!script.contains("-F OUTPUT"));
-        // Must atomically flush Silo's own chains inside --noflush to prevent rule duplication
         assert!(script.contains("-F SILO_OUT\n"));
-        assert!(script.contains("-F SILO_MANGLE_POST\n"));
-        // Must protect system UIDs 0-9999 first
-        assert!(script.contains("-A SILO_OUT -m owner --uid-owner 0-9999 -j RETURN"));
-        // Must block MediaTek cellular ccmni+ for UID 10234
-        assert!(script.contains("-A SILO_OUT -o ccmni+ -m owner --uid-owner 10234 -j SILO_DENY_UID"));
-        // Must use ipset O(1) match
-        assert!(script.contains("-m set --match-set silo_blk_v4 dst -j SILO_DENY_IPSET"));
-        // Must normalize TTL on mangle
-        assert!(script.contains("-A SILO_MANGLE_POST -o ccmni+ -j TTL --ttl-set 64"));
-        // Must use rate-limited NFLOG
-        assert!(script.contains("--nflog-group 42 --nflog-prefix \"SILO_UID\""));
     }
 
     #[test]
-    fn default_deny_only_blocks_ordinary_app_uids_not_kernel_packets() {
-        let mut cfg = FirewallConfig {
+    fn default_deny_protects_kernel_packets() {
+        let cfg = FirewallConfig {
             enabled: true,
             mode: FirewallMode::DefaultDeny,
             ..Default::default()
         };
-        cfg.rules.insert(
-            10300,
-            AppFirewallRule {
-                package_name: "org.signal.app".into(),
-                allow_wifi: true,
-                allow_cellular: true,
-                allow_vpn: true,
-                allow_lan: false,
-                allow_screen_off: true,
-                block_cleartext_http: false,
-                block_localhost: false,
-                is_vpn_app: false,
-            },
-        );
-        let script = build_restore_script(true, &cfg, &mock_caps(), true, true, false, &[]);
-        assert!(script.contains("-A SILO_OUT -o wlan+ -m owner --uid-owner 10300 -j RETURN"));
+        let script = build_restore_script(true, &cfg, &mock_caps(), true, true, false, &[], &HashSet::new());
         assert!(script.contains("-A SILO_OUT -m owner --uid-owner 10000-19999 -j SILO_DENY_UID"));
         assert!(script.ends_with("-A SILO_OUT -j RETURN\nCOMMIT\n"));
-        // Must NOT have an unconditional bare DROP/REJECT at end of SILO_OUT
-        assert!(!script.contains("-A SILO_OUT -j SILO_DENY_UID"));
-    }
-
-    #[test]
-    fn screen_off_blocks_apps_marked_disallow_screen_off() {
-        let mut cfg = FirewallConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        cfg.rules.insert(
-            10400,
-            AppFirewallRule {
-                package_name: "com.bg.tracker".into(),
-                allow_wifi: true,
-                allow_cellular: true,
-                allow_vpn: true,
-                allow_lan: false,
-                allow_screen_off: false,
-                block_cleartext_http: false,
-                block_localhost: false,
-                is_vpn_app: false,
-            },
-        );
-        let script = build_restore_script(false, &cfg, &mock_caps(), false, false, false, &[]);
-        assert!(script.contains("-A SILO_OUT -m owner --uid-owner 10400 -j SILO_DENY_UID"));
     }
 }

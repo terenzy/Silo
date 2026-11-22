@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Silo</string>
+    <string name="app_name_disguise">NetDiag</string>
+    <string name="tile_lockdown">Kunci Jaringan</string>
+    <string name="tile_sensors">Matikan Sensor</string>
+    <string name="tile_panic">Reboot Darurat</string>
+</resources>

@@ -11,11 +11,14 @@ mod sentinel;
 mod sys;
 mod telemetry;
 
-use crate::automation::{execute_clean_bfu_reboot, AutomationEngine, PANIC_REBOOT_CONFIRM_TOKEN};
+use crate::automation::{
+    execute_clean_bfu_reboot, get_private_dns, set_private_dns, AutomationEngine,
+    PANIC_REBOOT_CONFIRM_TOKEN,
+};
 use crate::config::{
     is_protected_package, is_protected_uid, validate_cidr, validate_package_name, AppFirewallRule,
-    AppIsolationScope, SiloConfig, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR,
-    MAX_BLOCKLIST_ENTRIES,
+    AppIsolationScope, FreezeMode, SiloConfig, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_STATE_DIR, MAX_BLOCKLIST_ENTRIES,
 };
 use crate::firewall::{apply_firewall, ensure_hook_jumps, flush_firewall, probe_capabilities};
 use crate::freezer::FreezerEngine;
@@ -29,13 +32,13 @@ use crate::protocol::{
     ActiveInterfaces, DaemonCommand, DaemonStatus, IpcRequest, IpcResponse, KernelCapabilities,
 };
 use crate::scopes::{apply_app_scope, clear_app_scope, sync_all_scopes, ClipboardGuard};
-use crate::sentinel::run_sentinel_audit;
+use crate::sentinel::{run_live_proof, run_sentinel_audit};
 use crate::sys::{
     boottime_secs, detect_device_locked, detect_screen_on, is_ce_unlocked, read_uid_package_map,
 };
 use crate::telemetry::TelemetryRing;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,6 +84,8 @@ struct DaemonState {
     active_interfaces: ActiveInterfaces,
     last_firewall_error: Option<String>,
     previously_blocked_uids: HashSet<u32>,
+    /// Temporary network unblock grants: UID -> CLOCK_BOOTTIME expiry second.
+    temp_unblock_until: BTreeMap<u32, u64>,
     screen_on: bool,
     device_locked: bool,
     ce_unlocked: bool,
@@ -125,6 +130,7 @@ impl DaemonState {
             active_interfaces,
             last_firewall_error: None,
             previously_blocked_uids: HashSet::new(),
+            temp_unblock_until: BTreeMap::new(),
             screen_on: detect_screen_on(),
             device_locked: detect_device_locked(),
             ce_unlocked: is_ce_unlocked(),
@@ -142,11 +148,36 @@ impl DaemonState {
         self.config.save_atomic(&self.config_path)
     }
 
+    fn active_temp_unblock_set(&self) -> HashSet<u32> {
+        let now = boottime_secs();
+        self.temp_unblock_until
+            .iter()
+            .filter(|(_, &exp)| now < exp)
+            .map(|(&uid, _)| uid)
+            .collect()
+    }
+
+    fn expire_temp_unblocks(&mut self) -> Vec<u32> {
+        let now = boottime_secs();
+        let expired: Vec<u32> = self
+            .temp_unblock_until
+            .iter()
+            .filter(|(_, &exp)| now >= exp)
+            .map(|(&uid, _)| uid)
+            .collect();
+        for &uid in &expired {
+            self.temp_unblock_until.remove(&uid);
+        }
+        expired
+    }
+
     fn sync_firewall(&mut self) -> Result<(), String> {
+        let temp_set = self.active_temp_unblock_set();
         match apply_firewall(
             &self.config.firewall,
-            &self.caps,
+            &mut self.caps,
             self.screen_on,
+            &temp_set,
             &mut self.previously_blocked_uids,
         ) {
             Ok(res) => {
@@ -155,7 +186,7 @@ impl DaemonState {
                 self.ipset_backend = res.ipset_backend;
                 self.vpn_active = res.vpn_active;
                 self.active_interfaces = res.active_interfaces;
-                self.last_firewall_error = None;
+                self.last_firewall_error = res.warning;
                 Ok(())
             }
             Err(e) => {
@@ -167,14 +198,28 @@ impl DaemonState {
 
     fn sync_all_subsystems(&mut self) {
         let _ = self.sync_firewall();
-        if self.config.hardening.enabled {
-            let _ = self.hardening.apply(&self.config.hardening);
+        let cfg_h = self.config.hardening.clone();
+        if cfg_h.enabled {
+            let _ = self.hardening.apply(&cfg_h);
         }
         sync_all_scopes(&self.config.scopes);
     }
 
     fn status(&self, total_blocked: u64) -> DaemonStatus {
-        let uptime = boottime_secs().saturating_sub(self.started_boottime);
+        let now = boottime_secs();
+        let uptime = now.saturating_sub(self.started_boottime);
+        let temp_unblocks_remaining: BTreeMap<u32, u64> = self
+            .temp_unblock_until
+            .iter()
+            .filter_map(|(&uid, &exp)| {
+                if exp > now {
+                    Some((uid, exp - now))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         DaemonStatus {
             version: DAEMON_VERSION.to_string(),
             pid: std::process::id(),
@@ -192,19 +237,20 @@ impl DaemonState {
             ce_unlocked: self.ce_unlocked,
             sensors_off_active: self.automation.sensors_off_active(),
             frozen_uids_count: self.freezer.currently_frozen().len(),
+            suspended_pkgs_count: self.freezer.suspended_packages().len(),
             blocked_events_total: total_blocked,
             auto_reboot_remaining_secs: self.automation.auto_reboot_remaining_secs(
                 &self.config.automation,
                 self.ce_unlocked,
                 self.device_locked,
             ),
+            private_dns: get_private_dns(),
+            temp_unblocks_remaining,
             capabilities: self.caps.clone(),
             last_firewall_error: self.last_firewall_error.clone(),
         }
     }
 
-    /// Detects newly installed apps (via `/data/system/packages.list` mtime) and auto-blocks them
-    /// when `block_new_apps` is enabled.
     fn check_new_installed_apps(&mut self) {
         let cur_mtime = fs::metadata("/data/system/packages.list")
             .and_then(|m| m.modified())
@@ -218,7 +264,6 @@ impl DaemonState {
             return;
         }
 
-        // Safety invariant: if baseline was empty at boot, seed known_user_uids first without auto-blocking
         let baseline_ready = !self.known_user_uids.is_empty();
         let mut added_block = false;
 
@@ -353,10 +398,48 @@ fn dispatch_command(
                 return IpcResponse::err(id, "state lock poisoned");
             };
             st.config.firewall.rules.remove(&uid);
+            st.temp_unblock_until.remove(&uid);
             if let Err(e) = st.save_config() {
                 return IpcResponse::err(id, e);
             }
             match st.sync_firewall() {
+                Ok(()) => IpcResponse::ok_empty(id),
+                Err(e) => IpcResponse::err(id, e),
+            }
+        }
+
+        DaemonCommand::SetTempUnblock {
+            uid,
+            duration_minutes,
+        } => {
+            if is_protected_uid(uid) {
+                return IpcResponse::err(id, "System UID is already exempted");
+            }
+            let mins = duration_minutes.clamp(1, 240);
+            let Ok(mut st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            let expiry = boottime_secs().saturating_add(u64::from(mins) * 60);
+            st.temp_unblock_until.insert(uid, expiry);
+            match st.sync_firewall() {
+                Ok(()) => IpcResponse::ok(
+                    id,
+                    serde_json::json!({ "uid": uid, "remaining_secs": u64::from(mins) * 60 }),
+                ),
+                Err(e) => IpcResponse::err(id, e),
+            }
+        }
+
+        DaemonCommand::ClearTempUnblock { uid } => {
+            let Ok(mut st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            st.temp_unblock_until.remove(&uid);
+            let res = st.sync_firewall();
+            if st.caps.sock_destroy_available {
+                let _ = destroy_uid_sockets(uid);
+            }
+            match res {
                 Ok(()) => IpcResponse::ok_empty(id),
                 Err(e) => IpcResponse::err(id, e),
             }
@@ -413,6 +496,7 @@ fn dispatch_command(
             st.firewall_active = false;
             st.ipset_entries_loaded = 0;
             st.previously_blocked_uids.clear();
+            st.temp_unblock_until.clear();
             let _ = st.save_config();
             IpcResponse::ok_empty(id)
         }
@@ -527,13 +611,13 @@ fn dispatch_command(
                 .unwrap_or_else(|| {
                     (
                         st.uid_map.get(&uid).cloned().unwrap_or_default(),
-                        crate::config::FreezeMode::SoftCgroup,
+                        FreezeMode::SoftCgroup,
                         true,
                     )
                 });
             let sd = st.caps.sock_destroy_available;
             match st.freezer.freeze_uid_now(uid, &pkg, mode, kill_sock, sd) {
-                Ok(()) => IpcResponse::ok(id, st.freezer.status(&st.config.freezer)),
+                Ok(_detail) => IpcResponse::ok(id, st.freezer.status(&st.config.freezer)),
                 Err(e) => IpcResponse::err(id, e),
             }
         }
@@ -580,19 +664,21 @@ fn dispatch_command(
                     format!("Refused to modify scopes for {}", package_name),
                 );
             }
-            if let Err(e) = apply_app_scope(&package_name, &scope) {
-                return IpcResponse::err(id, e);
+            match apply_app_scope(&package_name, &scope) {
+                Ok(applied) => {
+                    let Ok(mut st) = state_mtx.lock() else {
+                        return IpcResponse::err(id, "state lock poisoned");
+                    };
+                    if scope.any_enabled() {
+                        st.config.scopes.apps.insert(package_name, scope);
+                    } else {
+                        st.config.scopes.apps.remove(&package_name);
+                    }
+                    let _ = st.save_config();
+                    IpcResponse::ok(id, serde_json::json!({ "applied_ops": applied }))
+                }
+                Err(e) => IpcResponse::err(id, e),
             }
-            let Ok(mut st) = state_mtx.lock() else {
-                return IpcResponse::err(id, "state lock poisoned");
-            };
-            if scope.any_enabled() {
-                st.config.scopes.apps.insert(package_name, scope);
-            } else {
-                st.config.scopes.apps.remove(&package_name);
-            }
-            let _ = st.save_config();
-            IpcResponse::ok_empty(id)
         }
 
         DaemonCommand::ApplyHardenedScope { package_name } => {
@@ -702,6 +788,15 @@ fn dispatch_command(
             }
         }
 
+        DaemonCommand::GetPrivateDns => IpcResponse::ok(id, get_private_dns()),
+
+        DaemonCommand::SetPrivateDns { mode, specifier } => {
+            match set_private_dns(&mode, &specifier) {
+                Ok(dns) => IpcResponse::ok(id, dns),
+                Err(e) => IpcResponse::err(id, e),
+            }
+        }
+
         DaemonCommand::TriggerPanicReboot { confirm_token } => {
             if confirm_token != PANIC_REBOOT_CONFIRM_TOKEN {
                 return IpcResponse::err(id, "Invalid panic reboot confirmation token");
@@ -724,6 +819,14 @@ fn dispatch_command(
             IpcResponse::ok(id, report)
         }
 
+        DaemonCommand::RunLiveProof => {
+            let Ok(st) = state_mtx.lock() else {
+                return IpcResponse::err(id, "state lock poisoned");
+            };
+            let proof = run_live_proof(&st.config, &st.caps, &st.hardening, &st.freezer);
+            IpcResponse::ok(id, proof)
+        }
+
         DaemonCommand::ExportConfigJson => {
             let Ok(st) = state_mtx.lock() else {
                 return IpcResponse::err(id, "state lock poisoned");
@@ -739,7 +842,6 @@ fn dispatch_command(
                 Ok(c) => c,
                 Err(e) => return IpcResponse::err(id, format!("invalid config JSON: {}", e)),
             };
-            // Safety invariant: imported backup never auto-triggers immediate BFU reboot unless explicitly verified
             if let Err(e) = imported.sanitize() {
                 return IpcResponse::err(id, e);
             }
@@ -763,12 +865,10 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
     let telemetry = Arc::new(Mutex::new(TelemetryRing::new()));
     let state = Arc::new(Mutex::new(DaemonState::new(config_path, boot_fail_marker)));
 
-    // Initial subsystem sync (Safe-First: if default config, firewall & hardening stay inactive)
     if let Ok(mut st) = state.lock() {
         st.sync_all_subsystems();
     }
 
-    // Thread 1: Signal forwarder (maps SIGTERM/SIGINT AtomicBool into thread-shared Arc<AtomicBool>)
     let stop_sig = Arc::clone(&stop);
     thread::spawn(move || {
         while !stop_sig.load(Ordering::Relaxed) {
@@ -780,7 +880,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
         }
     });
 
-    // Thread 2: Live NFLOG Kernel Packet Telemetry Listener (Zero-Disk RAM-Only Ring)
     let nflog_avail = state
         .lock()
         .map(|s| s.caps.nflog_available)
@@ -802,7 +901,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
         });
     }
 
-    // Thread 3: Fast Foreground Auto-Thaw Watcher (0% CPU when no UIDs are frozen or screen is off!)
     let stop_thaw = Arc::clone(&stop);
     let st_thaw = Arc::clone(&state);
     thread::spawn(move || {
@@ -822,8 +920,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
         }
     });
 
-    // Thread 4: Supervisor Loop (Dead-Man Switch clearance, screen/lock/VPN watcher,
-    //           netd jump verification, BFU timer, Wi-Fi/BT auto-off, clipboard guard, new-app watcher)
     let stop_sup = Arc::clone(&stop);
     let st_sup = Arc::clone(&state);
     thread::spawn(move || {
@@ -848,7 +944,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
             let mut trigger_bfu_reboot = false;
 
             if let Ok(mut st) = st_sup.lock() {
-                // Dead-Man Switch stability clearance after 45s of healthy operation
                 if st.boot_guard_armed
                     && !st.boot_guard_cleared
                     && boottime_secs().saturating_sub(st.started_boottime) >= BOOT_STABILITY_SECS
@@ -858,6 +953,10 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
                     st.boot_guard_armed = false;
                 }
 
+                // Expire any temporary network unblock grants & re-lock + SOCK_DESTROY immediately
+                let expired_uids = st.expire_temp_unblocks();
+                let temp_expired = !expired_uids.is_empty();
+
                 let screen_changed = st.screen_on != screen_now;
                 let vpn_changed = st.vpn_active != vpn_now;
                 st.screen_on = screen_now;
@@ -866,11 +965,14 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
                 st.active_interfaces = ifaces_now.clone();
                 st.vpn_active = vpn_now;
 
-                // Re-apply firewall if screen or VPN state changed
-                if st.config.firewall.enabled && (screen_changed || vpn_changed) {
+                if st.config.firewall.enabled && (screen_changed || vpn_changed || temp_expired) {
                     let _ = st.sync_firewall();
+                    if temp_expired && st.caps.sock_destroy_available {
+                        for uid in expired_uids {
+                            let _ = destroy_uid_sockets(uid);
+                        }
+                    }
                 } else if st.config.firewall.enabled && tick_count.is_multiple_of(6) {
-                    // Every 30s, ensure Android netd didn't displace our top-level SILO_OUT/SILO_IN jump
                     let ttl_v4 =
                         st.config.firewall.normalize_ttl_hl && st.caps.ttl_target_available;
                     let _ = ensure_hook_jumps("iptables", ttl_v4);
@@ -881,23 +983,19 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
                     }
                 }
 
-                // Freezer policy tick
                 let freezer_cfg = st.config.freezer.clone();
                 let sd_avail = st.caps.sock_destroy_available;
                 st.freezer.policy_tick(&freezer_cfg, screen_now, sd_avail);
 
-                // Clipboard auto-clear tick (every 10s when enabled)
                 if tick_count.is_multiple_of(2) {
                     let scopes_cfg = st.config.scopes.clone();
                     st.clipboard.tick(&scopes_cfg);
                 }
 
-                // New-app auto-block check (every 15s)
                 if tick_count.is_multiple_of(3) {
                     st.check_new_installed_apps();
                 }
 
-                // Automation tick (Sensors-on-Lock, Wi-Fi/BT Idle Auto-Off, BFU Auto-Reboot)
                 let auto_cfg = st.config.automation.clone();
                 if st
                     .automation
@@ -915,7 +1013,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
         }
     });
 
-    // Main thread: Authenticated Unix Domain Socket Server
     let st_ipc = Arc::clone(&state);
     let tel_ipc = Arc::clone(&telemetry);
     let handler = Arc::new(move |req: IpcRequest| dispatch_command(req, &st_ipc, &tel_ipc));
@@ -928,7 +1025,6 @@ fn run_daemon(socket_path: PathBuf, config_path: PathBuf, boot_fail_marker: Path
         }
     };
 
-    // Graceful cleanup: always unfreeze all apps so nothing is ever left stuck frozen!
     stop.store(true, Ordering::SeqCst);
     if let Ok(mut st) = state.lock() {
         st.freezer.thaw_all();
@@ -985,7 +1081,6 @@ fn main() {
         "emergency_flush" => {
             let caps = probe_capabilities();
             flush_firewall(&caps);
-            // Also ensure any cgroup-frozen user UIDs are thawed
             if let Ok(entries) = fs::read_dir("/sys/fs/cgroup") {
                 for e in entries.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
@@ -1005,7 +1100,23 @@ fn main() {
                     }
                 }
             }
-            println!("silod: emergency firewall flush & cgroup thaw complete");
+            if config_path.exists() {
+                let cfg = SiloConfig::load_or_default(&config_path);
+                let pm = crate::sys::resolve_bin("pm");
+                for entry in cfg.freezer.entries.values() {
+                    if validate_package_name(&entry.package_name)
+                        && !is_protected_package(&entry.package_name)
+                    {
+                        let _ = crate::sys::run_cmd(
+                            &pm,
+                            &["unsuspend", "--user", "0", &entry.package_name],
+                            None,
+                            2500,
+                        );
+                    }
+                }
+            }
+            println!("silod: emergency firewall flush, cgroup thaw & unsuspend complete");
             0
         }
         "status" => match run_single_rpc(&socket_path, r#"{"id":1,"cmd":"get_status"}"#) {

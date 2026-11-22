@@ -75,6 +75,7 @@ data class FirewallConfig(
     @SerialName("dns_leak_guard") val dnsLeakGuard: Boolean = false,
     @SerialName("ipv6_leak_guard") val ipv6LeakGuard: Boolean = false,
     @SerialName("block_cleartext_http_global") val blockCleartextHttpGlobal: Boolean = false,
+    @SerialName("anti_port_scan") val antiPortScan: Boolean = false,
     @SerialName("normalize_ttl_hl") val normalizeTtlHl: Boolean = false,
     @SerialName("ttl_value") val ttlValue: Int = 64,
     @SerialName("nflog_enabled") val nflogEnabled: Boolean = true,
@@ -159,7 +160,7 @@ data class AutomationConfig(
 
 @Serializable
 data class SiloConfig(
-    @SerialName("schema_version") val schemaVersion: Int = 1,
+    @SerialName("schema_version") val schemaVersion: Int = 2,
     val firewall: FirewallConfig = FirewallConfig(),
     val freezer: FreezerConfig = FreezerConfig(),
     val scopes: ScopesConfig = ScopesConfig(),
@@ -174,6 +175,7 @@ data class KernelCapabilities(
     @SerialName("ip6tables_available") val ip6tablesAvailable: Boolean = false,
     @SerialName("ipset_netlink_available") val ipsetNetlinkAvailable: Boolean = false,
     @SerialName("xt_set_available") val xtSetAvailable: Boolean = false,
+    @SerialName("xt_recent_available") val xtRecentAvailable: Boolean = false,
     @SerialName("nflog_available") val nflogAvailable: Boolean = false,
     @SerialName("ttl_target_available") val ttlTargetAvailable: Boolean = false,
     @SerialName("hl_target_available") val hlTargetAvailable: Boolean = false,
@@ -188,6 +190,12 @@ data class ActiveInterfaces(
     val cellular: List<String> = emptyList(),
     val vpn: List<String> = emptyList(),
     val other: List<String> = emptyList(),
+)
+
+@Serializable
+data class PrivateDnsState(
+    val mode: String = "opportunistic",
+    val specifier: String = "",
 )
 
 @Serializable
@@ -208,8 +216,11 @@ data class DaemonStatus(
     @SerialName("ce_unlocked") val ceUnlocked: Boolean = true,
     @SerialName("sensors_off_active") val sensorsOffActive: Boolean = false,
     @SerialName("frozen_uids_count") val frozenUidsCount: Int = 0,
+    @SerialName("suspended_pkgs_count") val suspendedPkgsCount: Int = 0,
     @SerialName("blocked_events_total") val blockedEventsTotal: Long = 0,
     @SerialName("auto_reboot_remaining_secs") val autoRebootRemainingSecs: Long? = null,
+    @SerialName("private_dns") val privateDns: PrivateDnsState = PrivateDnsState(),
+    @SerialName("temp_unblocks_remaining") val tempUnblocksRemaining: Map<Int, Long> = emptyMap(),
     val capabilities: KernelCapabilities = KernelCapabilities(),
     @SerialName("last_firewall_error") val lastFirewallError: String? = null,
 )
@@ -273,7 +284,9 @@ data class FreezerStatus(
     val enabled: Boolean = false,
     @SerialName("cgroup_v2_available") val cgroupV2Available: Boolean = false,
     @SerialName("currently_frozen_uids") val currentlyFrozenUids: List<Int> = emptyList(),
+    @SerialName("suspended_packages") val suspendedPackages: List<String> = emptyList(),
     @SerialName("configured_count") val configuredCount: Int = 0,
+    @SerialName("last_action_detail") val lastActionDetail: String? = null,
 )
 
 @Serializable
@@ -295,6 +308,27 @@ data class SentinelReport(
     @SerialName("app_listening_ports") val appListeningPorts: Int = 0,
     @SerialName("suspicious_root_procs") val suspiciousRootProcs: Int = 0,
     val findings: List<AuditFinding> = emptyList(),
+)
+
+@Serializable
+data class LiveProofItem(
+    val subsystem: String = "",
+    val verified: Boolean = false,
+    val evidence: String = "",
+)
+
+@Serializable
+data class LiveProofReport(
+    @SerialName("timestamp_ms") val timestampMs: Long = 0,
+    @SerialName("ipv4_hook_attached") val ipv4HookAttached: Boolean = false,
+    @SerialName("ipv4_silo_rules_count") val ipv4SiloRulesCount: Int = 0,
+    @SerialName("ipv6_hook_attached") val ipv6HookAttached: Boolean = false,
+    @SerialName("ipv6_silo_rules_count") val ipv6SiloRulesCount: Int = 0,
+    @SerialName("sysctl_enforced_count") val sysctlEnforcedCount: Int = 0,
+    @SerialName("sysctl_total_supported") val sysctlTotalSupported: Int = 0,
+    @SerialName("verified_frozen_pids") val verifiedFrozenPids: Int = 0,
+    @SerialName("suspended_packages_count") val suspendedPackagesCount: Int = 0,
+    val items: List<LiveProofItem> = emptyList(),
 )
 
 @Serializable

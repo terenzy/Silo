@@ -1,4 +1,4 @@
-use crate::protocol::{IpcRequest, IpcResponse, MAX_IPC_LINE_BYTES};
+use crate::protocol::{parse_ipc_request, IpcRequest, IpcResponse, MAX_IPC_LINE_BYTES};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -166,9 +166,11 @@ where
                 if trimmed.is_empty() {
                     continue;
                 }
-                let resp = match serde_json::from_str::<IpcRequest>(trimmed) {
+                let resp = match parse_ipc_request(trimmed) {
                     Ok(req) => handler(req),
-                    Err(e) => IpcResponse::err(0, format!("malformed request: {}", e)),
+                    Err((req_id, err_msg)) => {
+                        IpcResponse::err(req_id, format!("malformed request: {}", err_msg))
+                    }
                 };
                 if let Ok(mut out) = serde_json::to_string(&resp) {
                     out.push('\n');

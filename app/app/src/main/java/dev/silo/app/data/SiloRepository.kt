@@ -1,15 +1,14 @@
 package dev.silo.app.data
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import dev.silo.app.ipc.*
 import kotlinx.serialization.json.*
 
-/**
- * Pure parser for user-imported local IP/CIDR blocklists (FireHOL, Spamhaus, custom text files).
- * Ignores comments, blank lines, and extracts clean IPv4/IPv6/CIDR tokens safely.
- */
 object BlocklistParser {
     private val ipv4Regex = Regex("""^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$""")
     private val ipv6Regex = Regex("""^[0-9a-fA-F:]+(/\d{1,3})?$""")
@@ -20,7 +19,6 @@ object BlocklistParser {
             if (out.size >= maxEntries) return@forEach
             val stripped = line.substringBefore('#').substringBefore(';').trim()
             if (stripped.isEmpty()) return@forEach
-            // Handle hosts-like or CSV/whitespace lines by scanning tokens
             val token = stripped.split(Regex("""[\s,]+""")).firstOrNull { tok ->
                 ipv4Regex.matches(tok) || (tok.contains(':') && ipv6Regex.matches(tok))
             }
@@ -32,8 +30,59 @@ object BlocklistParser {
     }
 }
 
+enum class AppLanguagePref(val key: String) {
+    SYSTEM("system"),
+    INDONESIAN("id"),
+    ENGLISH("en");
+
+    companion object {
+        fun fromKey(k: String?): AppLanguagePref = entries.firstOrNull { it.key == k } ?: SYSTEM
+    }
+}
+
+enum class AppThemePref(val key: String) {
+    OBSIDIAN("obsidian"),
+    AMOLED("amoled"),
+    DYNAMIC("dynamic");
+
+    companion object {
+        fun fromKey(k: String?): AppThemePref = entries.firstOrNull { it.key == k } ?: OBSIDIAN
+    }
+}
+
 class SiloRepository(private val client: SiloClient = SiloClient()) {
     private val json = client.json
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences("silo_ui_prefs", Context.MODE_PRIVATE)
+
+    fun getLanguagePref(context: Context): AppLanguagePref =
+        AppLanguagePref.fromKey(prefs(context).getString("language", "system"))
+
+    fun setLanguagePref(context: Context, pref: AppLanguagePref) {
+        prefs(context).edit().putString("language", pref.key).apply()
+    }
+
+    fun getThemePref(context: Context): AppThemePref =
+        AppThemePref.fromKey(prefs(context).getString("theme", "obsidian"))
+
+    fun setThemePref(context: Context, pref: AppThemePref) {
+        prefs(context).edit().putString("theme", pref.key).apply()
+    }
+
+    /** Native Android 12-16 clipboard wipe guaranteed to work on One UI 7 even when shell cmd fails. */
+    fun clearClipboardNative(context: Context): Boolean {
+        return runCatching {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                ?: return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                cm.clearPrimaryClip()
+            } else {
+                cm.setPrimaryClip(ClipData.newPlainText("", ""))
+            }
+            true
+        }.getOrDefault(false)
+    }
 
     suspend fun getStatus(): Result<DaemonStatus> = client.call("get_status")
     suspend fun getConfig(): Result<SiloConfig> = client.call("get_config")
@@ -56,6 +105,17 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
 
     suspend fun removeAppFirewallRule(uid: Int): Result<Unit> =
         client.callRaw("remove_app_firewall_rule", buildJsonObject {
+            put("uid", uid)
+        }).map { }
+
+    suspend fun setTempUnblock(uid: Int, durationMinutes: Int): Result<Long> =
+        client.call<JsonObject>("set_temp_unblock", buildJsonObject {
+            put("uid", uid)
+            put("duration_minutes", durationMinutes)
+        }).map { it["remaining_secs"]?.jsonPrimitive?.longOrNull ?: (durationMinutes * 60L) }
+
+    suspend fun clearTempUnblock(uid: Int): Result<Unit> =
+        client.callRaw("clear_temp_unblock", buildJsonObject {
             put("uid", uid)
         }).map { }
 
@@ -171,6 +231,12 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
             put("enabled", enabled)
         }).map { it["sensors_off"]?.jsonPrimitive?.booleanOrNull ?: enabled }
 
+    suspend fun setPrivateDns(mode: String, specifier: String = ""): Result<PrivateDnsState> =
+        client.call("set_private_dns", buildJsonObject {
+            put("mode", mode)
+            put("specifier", specifier)
+        })
+
     suspend fun triggerPanicReboot(): Result<Unit> =
         client.callRaw("trigger_panic_reboot", buildJsonObject {
             put("confirm_token", "CONFIRM_SILO_BFU_REBOOT")
@@ -178,6 +244,9 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
 
     suspend fun runSentinelAudit(): Result<SentinelReport> =
         client.call("run_sentinel_audit", timeoutMs = 15_000L)
+
+    suspend fun runLiveProof(): Result<LiveProofReport> =
+        client.call("run_live_proof", timeoutMs = 15_000L)
 
     suspend fun exportConfigJson(): Result<String> =
         client.call<JsonObject>("export_config_json").map {
@@ -200,27 +269,11 @@ class SiloRepository(private val client: SiloClient = SiloClient()) {
         val primary = ComponentName(context, "dev.silo.app.LauncherDefault")
         val disguise = ComponentName(context, "dev.silo.app.LauncherDisguise")
         if (enabled) {
-            pm.setComponentEnabledSetting(
-                disguise,
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP,
-            )
-            pm.setComponentEnabledSetting(
-                primary,
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP,
-            )
+            pm.setComponentEnabledSetting(disguise, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP)
+            pm.setComponentEnabledSetting(primary, PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP)
         } else {
-            pm.setComponentEnabledSetting(
-                primary,
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP,
-            )
-            pm.setComponentEnabledSetting(
-                disguise,
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP,
-            )
+            pm.setComponentEnabledSetting(primary, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP)
+            pm.setComponentEnabledSetting(disguise, PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP)
         }
     }
 }

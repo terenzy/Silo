@@ -8,24 +8,27 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.rounded.ShowChart
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.silo.app.ui.SiloViewModel
+import dev.silo.app.ui.i18n.LocalSiloStrings
+import dev.silo.app.ui.i18n.resolveStrings
 import dev.silo.app.ui.screens.*
 import dev.silo.app.ui.theme.SiloTheme
 
-private enum class SiloTab(val label: String, val icon: ImageVector) {
-    DASHBOARD("Overview", Icons.Default.Shield),
-    FIREWALL("Firewall", Icons.Default.Policy),
-    ISOLATION("Silo", Icons.Default.Lock),
-    MONITOR("Monitor", Icons.Default.Radar),
-    HARDENING("Kernel", Icons.Default.Tune),
-    SENTINEL("Audit", Icons.Default.VerifiedUser),
+private enum class SiloNavTab(val icon: ImageVector) {
+    HOME(Icons.Rounded.Shield),
+    APPS(Icons.Rounded.Apps),
+    TRAFFIC(Icons.AutoMirrored.Rounded.ShowChart),
+    SYSTEM(Icons.Rounded.Tune),
 }
 
 class MainActivity : ComponentActivity() {
@@ -33,9 +36,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            SiloTheme(darkTheme = true) {
-                SiloRootHost()
-            }
+            SiloRootHost()
         }
     }
 }
@@ -44,61 +45,77 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
     val state by vm.ui.collectAsStateWithLifecycle()
-    var currentTab by remember { mutableStateOf(SiloTab.DASHBOARD) }
-    val snackbarHostState = remember { SnackbarHostState() }
+    val strings = remember(state.languagePref) { resolveStrings(state.languagePref) }
 
-    LaunchedEffect(state.snackbarMessage) {
-        val msg = state.snackbarMessage
-        if (msg != null) {
-            snackbarHostState.showSnackbar(msg)
-            vm.clearSnackbar()
-        }
-    }
+    SiloTheme(themePref = state.themePref) {
+        CompositionLocalProvider(LocalSiloStrings provides strings) {
+            var currentTab by remember { mutableStateOf(SiloNavTab.HOME) }
+            val snackbarHostState = remember { SnackbarHostState() }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        when (currentTab) {
-                            SiloTab.DASHBOARD -> "Silo"
-                            SiloTab.FIREWALL -> "Kernel Firewall"
-                            SiloTab.ISOLATION -> "Scopes & Freezer"
-                            SiloTab.MONITOR -> "Live Monitor"
-                            SiloTab.HARDENING -> "Hardening & BFU"
-                            SiloTab.SENTINEL -> "Stealth Sentinel"
-                        }
-                    )
-                },
-                actions = {
-                    IconButton(onClick = { vm.refreshAll() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh")
-                    }
-                },
-            )
-        },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        bottomBar = {
-            NavigationBar {
-                SiloTab.entries.forEach { tab ->
-                    NavigationBarItem(
-                        selected = currentTab == tab,
-                        onClick = { currentTab = tab },
-                        icon = { Icon(tab.icon, contentDescription = tab.label) },
-                        label = { Text(tab.label, maxLines = 1) },
-                    )
+            LaunchedEffect(state.snackbarMessage) {
+                val msg = state.snackbarMessage
+                if (msg != null) {
+                    snackbarHostState.showSnackbar(msg)
+                    vm.clearSnackbar()
                 }
             }
-        },
-    ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
-            when (currentTab) {
-                SiloTab.DASHBOARD -> DashboardScreen(state, vm)
-                SiloTab.FIREWALL -> FirewallScreen(state, vm)
-                SiloTab.ISOLATION -> IsolationScreen(state, vm)
-                SiloTab.MONITOR -> MonitorScreen(state, vm)
-                SiloTab.HARDENING -> HardeningScreen(state, vm)
-                SiloTab.SENTINEL -> SentinelScreen(state, vm)
+
+            Scaffold(
+                containerColor = MaterialTheme.colorScheme.background,
+                topBar = {
+                    TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.background,
+                        ),
+                        title = {
+                            Text(
+                                when (currentTab) {
+                                    SiloNavTab.HOME -> strings.titleHome
+                                    SiloNavTab.APPS -> strings.titleApps
+                                    SiloNavTab.TRAFFIC -> strings.titleTraffic
+                                    SiloNavTab.SYSTEM -> strings.titleSystem
+                                },
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        },
+                        actions = {
+                            IconButton(onClick = { vm.refreshAll() }) {
+                                Icon(Icons.Rounded.Refresh, contentDescription = null)
+                            }
+                        },
+                    )
+                },
+                snackbarHost = { SnackbarHost(snackbarHostState) },
+                bottomBar = {
+                    NavigationBar(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        tonalElevation = 0.dp,
+                    ) {
+                        SiloNavTab.entries.forEach { tab ->
+                            val label = when (tab) {
+                                SiloNavTab.HOME -> strings.tabHome
+                                SiloNavTab.APPS -> strings.tabApps
+                                SiloNavTab.TRAFFIC -> strings.tabTraffic
+                                SiloNavTab.SYSTEM -> strings.tabSystem
+                            }
+                            NavigationBarItem(
+                                selected = currentTab == tab,
+                                onClick = { currentTab = tab },
+                                icon = { Icon(tab.icon, contentDescription = label) },
+                                label = { Text(label, maxLines = 1) },
+                            )
+                        }
+                    }
+                },
+            ) { padding ->
+                Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+                    when (currentTab) {
+                        SiloNavTab.HOME -> HomeScreen(state, vm)
+                        SiloNavTab.APPS -> AppsScreen(state, vm)
+                        SiloNavTab.TRAFFIC -> TrafficScreen(state, vm)
+                        SiloNavTab.SYSTEM -> SystemScreen(state, vm)
+                    }
+                }
             }
         }
     }
