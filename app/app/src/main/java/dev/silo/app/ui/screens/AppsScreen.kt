@@ -14,8 +14,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -32,11 +34,38 @@ import dev.silo.app.ui.SiloUiState
 import dev.silo.app.ui.SiloViewModel
 import dev.silo.app.ui.i18n.LocalSiloStrings
 import dev.silo.app.ui.theme.*
+import java.util.Locale
 
 private enum class AppListFilter { USER, RESTRICTED, AUDIT, SYSTEM }
 private enum class AppSheetTab { NETWORK, PERMS, FREEZER }
 
-private val ALL_PERM_CATEGORIES = listOf(
+/**
+ * Strictly mutually-exclusive effective UI mode for a permission category row (APP-C01, APP-C02).
+ * Guarantee: across all possible inputs, AT MOST ONE action pill is ever active (0 for UNGRANTED, 1 for others).
+ */
+enum class PermEffectiveUiMode {
+    /** Runtime granted (or AppOps-only allowed) AND AppOps allows normal access ("default"/"allow"). */
+    NORMAL,
+
+    /** Runtime granted (or AppOps-only with foreground) AND AppOps mode == "foreground". */
+    FOREGROUND,
+
+    /** Runtime still granted (or AppOps-only), AppOps mode == "ignore" (silent fake-empty block). */
+    FAKE_EMPTY,
+
+    /** Actively revoked/blocked: (!runtimeGranted && appopsMode in {"ignore","deny"}) OR (appopsMode == "deny"). */
+    REVOKED,
+
+    /** Runtime permission NOT granted AND AppOps not actively ignoring/denying (e.g., default/allow/foreground). */
+    UNGRANTED;
+
+    val isNormalPillActive: Boolean get() = this == NORMAL
+    val isForegroundPillActive: Boolean get() = this == FOREGROUND
+    val isFakeEmptyPillActive: Boolean get() = this == FAKE_EMPTY
+    val isRevokedPillActive: Boolean get() = this == REVOKED
+}
+
+val ALL_PERM_CATEGORIES: List<String> = listOf(
     "camera",
     "microphone",
     "location",
@@ -49,7 +78,17 @@ private val ALL_PERM_CATEGORIES = listOf(
     "background",
 )
 
-private val AUDITABLE_CATEGORIES = listOf(
+val APPOPS_ONLY_CATEGORIES: Set<String> = setOf("clipboard", "background")
+
+/** Exact foreground-capable category set from PROJECT.md § Interface Contracts § 2. */
+val FOREGROUND_SUPPORTED_CATEGORIES: Set<String> = setOf(
+    "camera",
+    "microphone",
+    "location",
+    "sensors",
+)
+
+private val AUDITABLE_CATEGORIES: List<String> = listOf(
     "all",
     "camera",
     "microphone",
@@ -59,8 +98,113 @@ private val AUDITABLE_CATEGORIES = listOf(
     "media",
     "sms_calllog",
     "sensors",
-    "background",
 )
+
+/**
+ * Pure, strictly mutually-exclusive UI mode resolver (APP-C01, APP-C02).
+ * `Normal` is NEVER active when `hasRuntimePerms && !runtimeGranted`.
+ */
+fun resolvePermUiMode(
+    hasRuntimePerms: Boolean,
+    runtimeGranted: Boolean,
+    appopsMode: String,
+): PermEffectiveUiMode {
+    val mode = appopsMode.trim().lowercase(Locale.ROOT)
+    return if (hasRuntimePerms) {
+        if (!runtimeGranted) {
+            when (mode) {
+                "ignore", "deny" -> PermEffectiveUiMode.REVOKED
+                else -> PermEffectiveUiMode.UNGRANTED
+            }
+        } else {
+            when (mode) {
+                "ignore" -> PermEffectiveUiMode.FAKE_EMPTY
+                "deny" -> PermEffectiveUiMode.REVOKED
+                "foreground" -> PermEffectiveUiMode.FOREGROUND
+                else -> PermEffectiveUiMode.NORMAL
+            }
+        }
+    } else {
+        when (mode) {
+            "ignore" -> PermEffectiveUiMode.FAKE_EMPTY
+            "deny" -> PermEffectiveUiMode.REVOKED
+            "foreground" -> PermEffectiveUiMode.FOREGROUND
+            else -> PermEffectiveUiMode.NORMAL
+        }
+    }
+}
+
+/**
+ * Resolves UI mode combining live daemon `CategoryPermLiveState?` with local `PackageManager` fallback.
+ */
+fun resolvePermUiMode(
+    category: String,
+    liveState: CategoryPermLiveState?,
+    localRuntimeGranted: Boolean,
+): PermEffectiveUiMode {
+    val hasRuntime = resolveHasRuntimePerms(category, liveState)
+    val effectiveGranted = if (!hasRuntime) {
+        false
+    } else {
+        liveState?.runtimeGranted ?: localRuntimeGranted
+    }
+    val mode = liveState?.appopsMode ?: "default"
+    return resolvePermUiMode(
+        hasRuntimePerms = hasRuntime,
+        runtimeGranted = effectiveGranted,
+        appopsMode = mode,
+    )
+}
+
+fun resolveHasRuntimePerms(
+    category: String,
+    liveState: CategoryPermLiveState?,
+): Boolean = (liveState?.hasRuntimePerms ?: true) && !APPOPS_ONLY_CATEGORIES.contains(category)
+
+fun resolveSupportsForeground(
+    category: String,
+    liveState: CategoryPermLiveState?,
+): Boolean {
+    val daemonFlag = liveState?.supportsForeground ?: true
+    return if (category in ALL_PERM_CATEGORIES) {
+        daemonFlag && FOREGROUND_SUPPORTED_CATEGORIES.contains(category)
+    } else {
+        daemonFlag
+    }
+}
+
+/** Ceiling-rounded temporary unblock minutes (60s -> 1m, 61s -> 2m, APP-L01). */
+fun formatTempUnblockMinutes(remainingSecs: Long): Long =
+    ((remainingSecs.coerceAtLeast(0L) + 59L) / 60L).coerceAtLeast(1L)
+
+/**
+ * Splits permission categories into primary (declared/granted/AppOps-only/active guard/non-default op)
+ * and undeclared (collapsible secondary section) so irrelevant manifest permissions don't clutter UI (APP-H10).
+ */
+fun partitionPermCategories(
+    allCategories: List<String>,
+    declaredCategories: Set<String>,
+    grantedCategories: Set<String>,
+    guard: AppPermGuard,
+    liveByCat: Map<String, CategoryPermLiveState>,
+): Pair<List<String>, List<String>> {
+    val primary = mutableListOf<String>()
+    val undeclared = mutableListOf<String>()
+    for (cat in allCategories) {
+        val live = liveByCat[cat]
+        val mode = live?.appopsMode?.trim()?.lowercase(Locale.ROOT) ?: "default"
+        val hasNonDefaultAppOp = mode != "default" && mode != "allow"
+        val hasGuard = guard.autoRevokeOnBg.contains(cat) || guard.lockedDeny.contains(cat)
+        val showPrimary = APPOPS_ONLY_CATEGORIES.contains(cat) ||
+            declaredCategories.contains(cat) ||
+            grantedCategories.contains(cat) ||
+            hasGuard ||
+            hasNonDefaultAppOp ||
+            live?.runningNow == true
+        if (showPrimary) primary.add(cat) else undeclared.add(cat)
+    }
+    return primary to undeclared
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -69,29 +213,39 @@ fun AppsScreen(
     vm: SiloViewModel,
 ) {
     val s = LocalSiloStrings.current
-    var query by remember { mutableStateOf("") }
-    var filter by remember { mutableStateOf(AppListFilter.USER) }
-    var auditCategory by remember { mutableStateOf("all") }
-    var selectedAppPkg by remember { mutableStateOf<String?>(null) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var filterName by rememberSaveable { mutableStateOf(AppListFilter.USER.name) }
+    val filter = AppListFilter.entries.firstOrNull { it.name == filterName } ?: AppListFilter.USER
+    var auditCategory by rememberSaveable { mutableStateOf("all") }
+    var selectedAppPkg by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedSheetTabName by rememberSaveable { mutableStateOf(AppSheetTab.NETWORK.name) }
+    val selectedSheetInitialTab = AppSheetTab.entries.firstOrNull { it.name == selectedSheetTabName } ?: AppSheetTab.NETWORK
 
     val fw = state.config.firewall
     val defaultAllow = fw.mode == FirewallMode.DEFAULT_ALLOW
 
     val filtered = remember(state.apps, query, filter, auditCategory, fw, state.config.scopes, state.config.freezer) {
-        val q = query.trim().lowercase()
+        val q = query.trim().lowercase(Locale.ROOT)
         state.apps.filter { app ->
             if (app.isProtected) return@filter false
             val matchesQuery = q.isEmpty() ||
-                app.label.lowercase().contains(q) ||
-                app.packageName.lowercase().contains(q)
+                app.label.lowercase(Locale.ROOT).contains(q) ||
+                app.packageName.lowercase(Locale.ROOT).contains(q)
             if (!matchesQuery) return@filter false
 
             when (filter) {
-                AppListFilter.USER -> !app.isSystem && app.hasLauncher
+                AppListFilter.USER -> !app.isSystem
                 AppListFilter.SYSTEM -> app.isSystem
                 AppListFilter.RESTRICTED -> {
                     val r = fw.rules[app.uid]
-                    val hasNetBlock = r != null && (!r.allowWifi || !r.allowCellular || !r.allowVpn || !r.allowScreenOff)
+                    val hasNetBlock = r != null && (
+                        !r.allowWifi ||
+                            !r.allowCellular ||
+                            !r.allowVpn ||
+                            !r.allowScreenOff ||
+                            r.blockCleartextHttp ||
+                            r.blockLocalhost
+                        )
                     val hasScope = (state.config.scopes.apps[app.packageName]?.activeCount() ?: 0) > 0
                     val hasGuard = (state.config.scopes.guards[app.packageName]?.totalCount() ?: 0) > 0
                     val hasFreeze = state.config.freezer.entries.containsKey(app.uid)
@@ -108,20 +262,25 @@ fun AppsScreen(
         }
     }
 
-    // Resolve live selectedApp from fresh state.apps so Risk & Granted Perms update immediately!
     val selectedApp = remember(selectedAppPkg, state.apps) {
         selectedAppPkg?.let { pkg -> state.apps.firstOrNull { it.packageName == pkg } }
     }
 
     if (selectedApp != null) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
-            onDismissRequest = { selectedAppPkg = null },
+            onDismissRequest = {
+                selectedAppPkg = null
+                vm.clearSheetFeedback()
+            },
+            sheetState = sheetState,
             containerColor = MaterialTheme.colorScheme.surface,
         ) {
             AppControlSheet(
                 app = selectedApp,
                 state = state,
                 vm = vm,
+                initialTab = selectedSheetInitialTab,
                 isFrozen = state.freezerStatus.currentlyFrozenUids.contains(selectedApp.uid),
                 isSuspended = state.freezerStatus.suspendedPackages.contains(selectedApp.packageName),
             )
@@ -148,7 +307,7 @@ fun AppsScreen(
             trailingIcon = {
                 if (query.isNotEmpty()) {
                     IconButton(onClick = { query = "" }) {
-                        Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Rounded.Close, contentDescription = s.dismiss, modifier = Modifier.size(18.dp))
                     }
                 }
             },
@@ -170,8 +329,24 @@ fun AppsScreen(
                 AppListFilter.SYSTEM to s.filterSystem,
             ),
             selected = filter,
-            onSelect = { filter = it },
+            onSelect = { filterName = it.name },
         )
+
+        if (!fw.enabled && filter != AppListFilter.AUDIT) {
+            Spacer(Modifier.height(8.dp))
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = SiloAmber.copy(alpha = 0.13f),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    s.firewallOffRuleHint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SiloAmber,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                )
+            }
+        }
 
         // Global Permission Audit Category Selector + Bulk Revoke
         if (filter == AppListFilter.AUDIT) {
@@ -193,30 +368,51 @@ fun AppsScreen(
                     val label = if (cat == "all") s.auditAllCategories else s.categoryLabel(cat)
                     val selected = auditCategory == cat
                     Surface(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { auditCategory = cat },
+                        onClick = { auditCategory = cat },
+                        modifier = Modifier.defaultMinSize(minHeight = 40.dp),
                         shape = RoundedCornerShape(12.dp),
                         color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
                     ) {
-                        Text(
-                            label,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        Box(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
             }
             if (auditCategory != "all" && filtered.isNotEmpty()) {
+                val bulkBusy = state.pendingPermKeys.contains("bulk:$auditCategory")
                 Spacer(Modifier.height(8.dp))
                 FilledTonalButton(
                     onClick = { vm.bulkRevokeCategory(auditCategory, filtered.map { it.packageName }) },
+                    enabled = !bulkBusy,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 42.dp),
                 ) {
-                    Icon(Icons.Rounded.RemoveModerator, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(16.dp))
+                    if (bulkBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = SiloCrimson,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Rounded.RemoveModerator,
+                            contentDescription = null,
+                            tint = SiloCrimson,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                     Spacer(Modifier.width(6.dp))
                     Text(
                         "${s.revokeAllVisible} (${s.categoryLabel(auditCategory)}: ${filtered.size})",
@@ -243,10 +439,15 @@ fun AppsScreen(
             ) {
                 itemsIndexed(filtered, key = { _, app -> app.packageName }) { idx, app ->
                     if (filter == AppListFilter.AUDIT) {
+                        val rowPending = state.pendingPermKeys.any { it.startsWith("${app.packageName}:") }
                         AuditAppRow(
                             app = app,
                             selectedCategory = auditCategory,
-                            onOpen = { selectedAppPkg = app.packageName },
+                            isPending = rowPending,
+                            onOpen = {
+                                selectedSheetTabName = AppSheetTab.PERMS.name
+                                selectedAppPkg = app.packageName
+                            },
                             onRevoke = {
                                 if (auditCategory == "all") {
                                     vm.revokeAllSensitiveForApp(app)
@@ -256,7 +457,6 @@ fun AppsScreen(
                             },
                         )
                     } else {
-                        // Safe default rule: ALWAYS allowScreenOff = true on quick toggle so user is never surprised!
                         val rule = fw.rules[app.uid] ?: AppFirewallRule(
                             packageName = app.packageName,
                             allowWifi = defaultAllow,
@@ -277,28 +477,27 @@ fun AppsScreen(
                             isSuspended = isSuspended,
                             guardCount = guardCount,
                             tempUnblockSecs = tempLeft,
-                            onOpen = { selectedAppPkg = app.packageName },
+                            onOpen = {
+                                selectedSheetTabName = AppSheetTab.NETWORK.name
+                                selectedAppPkg = app.packageName
+                            },
                             onToggleWifi = {
-                                vm.updateAppFirewallRule(
-                                    app.uid,
-                                    rule.copy(packageName = app.packageName, allowWifi = !rule.allowWifi),
-                                )
+                                vm.mutateAppFirewallRule(app.uid, app.packageName) { cur ->
+                                    cur.copy(allowWifi = !cur.allowWifi)
+                                }
                             },
                             onToggleCell = {
-                                vm.updateAppFirewallRule(
-                                    app.uid,
-                                    rule.copy(packageName = app.packageName, allowCellular = !rule.allowCellular),
-                                )
+                                vm.mutateAppFirewallRule(app.uid, app.packageName) { cur ->
+                                    cur.copy(allowCellular = !cur.allowCellular)
+                                }
                             },
                             onToggleFreeze = {
                                 if (isFrozen || isSuspended) {
                                     vm.thawUidNow(app.uid)
                                 } else {
-                                    val existing = state.config.freezer.entries[app.uid]
-                                    if (existing == null) {
-                                        vm.setFreezerEntry(app.uid, FreezerEntry(packageName = app.packageName))
-                                    }
-                                    vm.freezeUidNow(app.uid)
+                                    val entry = state.config.freezer.entries[app.uid]
+                                        ?: FreezerEntry(packageName = app.packageName)
+                                    vm.ensureEntryAndFreeze(app.uid, entry)
                                 }
                             },
                         )
@@ -314,6 +513,7 @@ fun AppsScreen(
 private fun AuditAppRow(
     app: InstalledApp,
     selectedCategory: String,
+    isPending: Boolean,
     onOpen: () -> Unit,
     onRevoke: () -> Unit,
 ) {
@@ -353,15 +553,26 @@ private fun AuditAppRow(
         }
         FilledTonalButton(
             onClick = onRevoke,
+            enabled = !isPending,
             shape = RoundedCornerShape(10.dp),
-            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-            modifier = Modifier.height(32.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier
+                .defaultMinSize(minHeight = 40.dp)
+                .minimumInteractiveComponentSize(),
         ) {
-            Text(
-                if (selectedCategory == "all") s.revokeAllVisible else s.revokeOne,
-                style = MaterialTheme.typography.labelSmall,
-                color = SiloCrimson,
-            )
+            if (isPending) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = SiloCrimson,
+                )
+            } else {
+                Text(
+                    if (selectedCategory == "all") s.revokeAllVisible else s.revokeOne,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SiloCrimson,
+                )
+            }
         }
     }
 }
@@ -397,7 +608,7 @@ private fun MinimalAppRow(
         AppIconBox(iconBmp, app.label)
 
         Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(
                     app.label,
                     style = MaterialTheme.typography.bodyMedium,
@@ -406,19 +617,25 @@ private fun MinimalAppRow(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false),
                 )
+                if (!app.isSystem && !app.hasLauncher) {
+                    MiniTag(s.bgAppBadge, SiloAmber)
+                }
+                if (!app.hasInternetPermission) {
+                    MiniTag(s.offlineOnlyBadge, MaterialTheme.colorScheme.onSurfaceVariant)
+                }
                 if (isSuspended) {
                     MiniTag(s.suspendedBadge, SiloCyan)
                 } else if (isFrozen) {
                     MiniTag(s.frozenBadge, SiloCyan)
-                } else if (guardCount > 0) {
+                }
+                if (guardCount > 0) {
                     MiniTag("G:$guardCount", SiloEmerald)
                 }
             }
 
-            // Always show concrete reason — never an unexplained scary label!
             val metaParts = buildList {
                 if (tempUnblockSecs != null) {
-                    add("${s.tempUnblockActive} ${(tempUnblockSecs / 60) + 1}m")
+                    add("${s.tempUnblockActive} ${formatTempUnblockMinutes(tempUnblockSecs)}m")
                 }
                 if (app.grantedSensitiveCategories.isNotEmpty()) {
                     add("${app.grantedSensitiveCategories.size} ${s.activePermsShort}")
@@ -445,9 +662,10 @@ private fun MinimalAppRow(
             )
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
             InlineIconToggle(
                 icon = if (rule.allowWifi) Icons.Rounded.Wifi else Icons.Rounded.WifiOff,
+                contentDescription = s.a11yToggleWifi,
                 active = rule.allowWifi,
                 activeColor = SiloEmerald,
                 inactiveColor = SiloCrimson,
@@ -455,6 +673,7 @@ private fun MinimalAppRow(
             )
             InlineIconToggle(
                 icon = if (rule.allowCellular) Icons.Rounded.SignalCellularAlt else Icons.Rounded.SignalCellularOff,
+                contentDescription = s.a11yToggleCellular,
                 active = rule.allowCellular,
                 activeColor = SiloEmerald,
                 inactiveColor = SiloCrimson,
@@ -462,6 +681,7 @@ private fun MinimalAppRow(
             )
             InlineIconToggle(
                 icon = Icons.Rounded.AcUnit,
+                contentDescription = s.a11yToggleFreeze,
                 active = isFrozen || isSuspended,
                 activeColor = SiloCyan,
                 inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
@@ -477,7 +697,9 @@ private fun AppIconBox(iconBmp: ImageBitmap?, label: String) {
         Image(
             bitmap = iconBmp,
             contentDescription = null,
-            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
+            modifier = Modifier
+                .size(40.dp)
+                .clip(RoundedCornerShape(10.dp)),
         )
     } else {
         Surface(
@@ -499,6 +721,7 @@ private fun AppIconBox(iconBmp: ImageBitmap?, label: String) {
 @Composable
 private fun InlineIconToggle(
     icon: ImageVector,
+    contentDescription: String,
     active: Boolean,
     activeColor: Color,
     inactiveColor: Color,
@@ -507,12 +730,18 @@ private fun InlineIconToggle(
     val tint = if (active) activeColor else inactiveColor
     val bg = if (active) activeColor.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
     Surface(
-        modifier = Modifier.size(34.dp).clip(CircleShape).clickable(onClick = onClick),
+        onClick = onClick,
+        modifier = Modifier
+            .defaultMinSize(minWidth = 40.dp, minHeight = 40.dp)
+            .minimumInteractiveComponentSize(),
         shape = CircleShape,
         color = bg,
     ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(17.dp))
+        Box(
+            modifier = Modifier.size(38.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, contentDescription = contentDescription, tint = tint, modifier = Modifier.size(18.dp))
         }
     }
 }
@@ -526,6 +755,8 @@ private fun MiniTag(text: String, color: Color) {
             style = MaterialTheme.typography.labelSmall,
             color = color,
             fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -535,15 +766,23 @@ private fun AppControlSheet(
     app: InstalledApp,
     state: SiloUiState,
     vm: SiloViewModel,
+    initialTab: AppSheetTab,
     isFrozen: Boolean,
     isSuspended: Boolean,
 ) {
     val s = LocalSiloStrings.current
-    var tab by remember { mutableStateOf(AppSheetTab.NETWORK) }
+    var tabName by rememberSaveable(app.packageName, initialTab.name) { mutableStateOf(initialTab.name) }
+    val tab = AppSheetTab.entries.firstOrNull { it.name == tabName } ?: AppSheetTab.NETWORK
+    var showUndeclared by rememberSaveable(app.packageName) { mutableStateOf(false) }
 
-    // Fetch REAL-TIME AppOps state from daemon whenever this app sheet opens!
-    LaunchedEffect(app.packageName) {
+    // Track active inspected package so ON_RESUME / Refresh keeps live AppOps in sync (APP-H11)
+    DisposableEffect(app.packageName) {
+        vm.clearSheetFeedback()
+        vm.setActiveInspectedPackage(app.packageName)
         vm.inspectAppPermissions(app.packageName)
+        onDispose {
+            vm.setActiveInspectedPackage(null)
+        }
     }
 
     val fw = state.config.firewall
@@ -558,8 +797,12 @@ private fun AppControlSheet(
     )
     val guard = state.config.scopes.guards[app.packageName] ?: AppPermGuard()
     val livePerms = state.liveAppPerms[app.packageName]
+    val isLoadingPerms = state.loadingAppPerms.contains(app.packageName)
+    val permsError = state.appPermErrors[app.packageName]
+    val legacyScopeCount = state.config.scopes.apps[app.packageName]?.activeCount() ?: 0
     val freezerEntry = state.config.freezer.entries[app.uid]
     val tempRemaining = state.status.tempUnblocksRemaining[app.uid]
+    val revokingAll = state.pendingPermKeys.contains("${app.packageName}:*:revoke_all")
 
     Column(
         modifier = Modifier
@@ -571,7 +814,9 @@ private fun AppControlSheet(
     ) {
         // App Sheet Header
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -589,6 +834,15 @@ private fun AppControlSheet(
                 PrivacyRiskLevel.LOW -> s.riskLow to SiloEmerald
             }
             MiniTag(riskLabel, riskColor)
+        }
+
+        // Visible inline feedback banner inside sheet window (APP-C06)
+        state.sheetFeedback?.let { fb ->
+            SiloInlineFeedbackBanner(
+                message = fb.message,
+                isError = fb.isError,
+                onDismiss = { vm.clearSheetFeedback() },
+            )
         }
 
         // To-the-point Risk Breakdown & Actionable Mitigation Card
@@ -635,10 +889,27 @@ private fun AppControlSheet(
                     if (app.grantedSensitiveCategories.isNotEmpty()) {
                         FilledTonalButton(
                             onClick = { vm.revokeAllSensitiveForApp(app) },
+                            enabled = !revokingAll,
                             shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp)
+                                .defaultMinSize(minHeight = 42.dp),
                         ) {
-                            Icon(Icons.Rounded.RemoveModerator, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(16.dp))
+                            if (revokingAll) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = SiloCrimson,
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Rounded.RemoveModerator,
+                                    contentDescription = null,
+                                    tint = SiloCrimson,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                            }
                             Spacer(Modifier.width(6.dp))
                             Text(s.revokeAllSensPerms, style = MaterialTheme.typography.labelMedium, color = SiloCrimson)
                         }
@@ -654,46 +925,70 @@ private fun AppControlSheet(
                 AppSheetTab.FREEZER to s.sheetFreezer,
             ),
             selected = tab,
-            onSelect = { tab = it },
+            onSelect = { tabName = it.name },
         )
 
         when (tab) {
             AppSheetTab.NETWORK -> {
-                SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
-                    SiloSwitchRow(s.allowWifi, s.allowWifiDesc, rule.allowWifi) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowWifi = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.allowCellular, s.allowCellularDesc, rule.allowCellular) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowCellular = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.allowVpn, s.allowVpnDesc, rule.allowVpn) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowVpn = it))
-                    }
-                    SiloHairline()
-                    SiloSwitchRow(s.allowLan, s.allowLanDesc, rule.allowLan) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, allowLan = it))
-                    }
-                    SiloHairline()
-                    // Crystal-clear non-inverted semantics: ON = Block while screen off!
-                    SiloSwitchRow(s.blockScreenOff, s.blockScreenOffDesc, !rule.allowScreenOff) { blockWhenAsleep ->
-                        vm.updateAppFirewallRule(
-                            app.uid,
-                            rule.copy(packageName = app.packageName, allowScreenOff = !blockWhenAsleep),
+                if (!fw.enabled) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = SiloAmber.copy(alpha = 0.13f),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            s.firewallOffRuleHint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SiloAmber,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         )
                     }
-                    SiloHairline()
-                    SiloSwitchRow(s.blockHttp, s.blockHttpDesc, rule.blockCleartextHttp) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, blockCleartextHttp = it))
+                }
+                if (!app.hasInternetPermission) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            s.noInternetPermHint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+                SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
+                    SiloSwitchRow(s.allowWifi, s.allowWifiDesc, rule.allowWifi) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(allowWifi = on) }
                     }
                     SiloHairline()
-                    SiloSwitchRow(s.blockLocalhost, s.blockLocalhostDesc, rule.blockLocalhost) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, blockLocalhost = it))
+                    SiloSwitchRow(s.allowCellular, s.allowCellularDesc, rule.allowCellular) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(allowCellular = on) }
                     }
                     SiloHairline()
-                    SiloSwitchRow(s.markVpnApp, s.markVpnAppDesc, rule.isVpnApp) {
-                        vm.updateAppFirewallRule(app.uid, rule.copy(packageName = app.packageName, isVpnApp = it))
+                    SiloSwitchRow(s.allowVpn, s.allowVpnDesc, rule.allowVpn) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(allowVpn = on) }
+                    }
+                    SiloHairline()
+                    SiloSwitchRow(s.allowLan, s.allowLanDesc, rule.allowLan) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(allowLan = on) }
+                    }
+                    SiloHairline()
+                    SiloSwitchRow(s.blockScreenOff, s.blockScreenOffDesc, !rule.allowScreenOff) { blockWhenAsleep ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(allowScreenOff = !blockWhenAsleep) }
+                    }
+                    SiloHairline()
+                    SiloSwitchRow(s.blockHttp, s.blockHttpDesc, rule.blockCleartextHttp) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(blockCleartextHttp = on) }
+                    }
+                    SiloHairline()
+                    SiloSwitchRow(s.blockLocalhost, s.blockLocalhostDesc, rule.blockLocalhost) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(blockLocalhost = on) }
+                    }
+                    SiloHairline()
+                    SiloSwitchRow(s.markVpnApp, s.markVpnAppDesc, rule.isVpnApp) { on ->
+                        vm.mutateAppFirewallRule(app.uid, app.packageName) { it.copy(isVpnApp = on) }
                     }
                 }
 
@@ -708,7 +1003,7 @@ private fun AppControlSheet(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp),
                             ) {
-                                Text("${s.revokeTempUnblock} (${(tempRemaining / 60) + 1}m)")
+                                Text("${s.revokeTempUnblock} (${formatTempUnblockMinutes(tempRemaining)}m)")
                             }
                         } else {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -753,34 +1048,208 @@ private fun AppControlSheet(
                     modifier = Modifier.padding(horizontal = 4.dp),
                 )
 
+                // Legacy v2 scope migration banner (APP-M18)
+                if (legacyScopeCount > 0) {
+                    SiloGroup(color = SiloAmber.copy(alpha = 0.14f)) {
+                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                "${s.legacyScopeTitle} ($legacyScopeCount)",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = SiloAmber,
+                            )
+                            Text(
+                                s.legacyScopeDesc,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            FilledTonalButton(
+                                onClick = { vm.clearLegacyAppScope(app.packageName) },
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.defaultMinSize(minHeight = 40.dp),
+                            ) {
+                                Text(s.clearLegacyScope, style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                }
+
                 val liveByCat = remember(livePerms) {
                     livePerms?.categories?.associateBy { it.category }.orEmpty()
                 }
 
-                SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
-                    ALL_PERM_CATEGORIES.forEachIndexed { idx, cat ->
-                        val catState = liveByCat[cat]
-                        val runtimeGranted = app.grantedSensitiveCategories.contains(cat)
-                        val appopsMode = catState?.appopsMode ?: "default"
-                        val runningNow = catState?.runningNow == true
-                        val lastAccess = catState?.lastAccess
-                        val isAutoRevoke = guard.autoRevokeOnBg.contains(cat)
-                        val isStrictLocked = guard.lockedDeny.contains(cat)
+                when {
+                    isLoadingPerms && livePerms == null -> {
+                        SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(20.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    s.loadingAppPermsLabel,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
 
-                        PermissionCategoryControlRow(
-                            title = s.categoryLabel(cat),
-                            desc = s.categoryDesc(cat),
-                            runtimeGranted = runtimeGranted,
-                            appopsMode = appopsMode,
-                            runningNow = runningNow,
-                            lastAccess = lastAccess,
-                            isAutoRevoke = isAutoRevoke,
-                            isStrictLocked = isStrictLocked,
-                            onAction = { action -> vm.setAppPermissionAction(app.packageName, cat, action) },
-                            onToggleAutoRevoke = { vm.toggleAppAutoRevoke(app.packageName, cat, !isAutoRevoke) },
-                            onToggleStrictLock = { vm.toggleAppStrictLock(app.packageName, cat, !isStrictLocked) },
-                        )
-                        if (idx < ALL_PERM_CATEGORIES.lastIndex) SiloHairline()
+                    permsError != null && livePerms == null -> {
+                        SiloGroup(color = SiloCrimson.copy(alpha = 0.13f)) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    s.permsLoadFailed,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = SiloCrimson,
+                                )
+                                Text(
+                                    permsError,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                FilledTonalButton(
+                                    onClick = { vm.inspectAppPermissions(app.packageName) },
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.defaultMinSize(minHeight = 40.dp),
+                                ) {
+                                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(s.retryAction)
+                                }
+                            }
+                        }
+                    }
+
+                    else -> {
+                        if (isLoadingPerms) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                        if (permsError != null) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = SiloAmber.copy(alpha = 0.14f),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        permsError,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SiloAmber,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(onClick = { vm.inspectAppPermissions(app.packageName) }) {
+                                        Text(s.retryAction, style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+
+                        val (primaryCats, undeclaredCats) = remember(
+                            app.declaredSensitiveCategories,
+                            app.grantedSensitiveCategories,
+                            guard,
+                            liveByCat,
+                        ) {
+                            partitionPermCategories(
+                                allCategories = ALL_PERM_CATEGORIES,
+                                declaredCategories = app.declaredSensitiveCategories,
+                                grantedCategories = app.grantedSensitiveCategories,
+                                guard = guard,
+                                liveByCat = liveByCat,
+                            )
+                        }
+
+                        SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)) {
+                            primaryCats.forEachIndexed { idx, cat ->
+                                PermissionCategoryControlRow(
+                                    packageName = app.packageName,
+                                    category = cat,
+                                    title = s.categoryLabel(cat),
+                                    desc = s.categoryDesc(cat),
+                                    localRuntimeGranted = app.grantedSensitiveCategories.contains(cat),
+                                    catState = liveByCat[cat],
+                                    isUndeclared = false,
+                                    isAutoRevoke = guard.autoRevokeOnBg.contains(cat),
+                                    isStrictLocked = guard.lockedDeny.contains(cat),
+                                    pendingPermKeys = state.pendingPermKeys,
+                                    onAction = { action -> vm.setAppPermissionAction(app.packageName, cat, action) },
+                                    onToggleAutoRevoke = { vm.toggleAppAutoRevoke(app.packageName, cat, !guard.autoRevokeOnBg.contains(cat)) },
+                                    onToggleStrictLock = { vm.toggleAppStrictLock(app.packageName, cat, !guard.lockedDeny.contains(cat)) },
+                                )
+                                if (idx < primaryCats.lastIndex) SiloHairline()
+                            }
+                        }
+
+                        if (undeclaredCats.isNotEmpty()) {
+                            Surface(
+                                onClick = { showUndeclared = !showUndeclared },
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .defaultMinSize(minHeight = 44.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 11.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "${s.undeclaredPermsSection} (${undeclaredCats.size})",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Icon(
+                                        if (showUndeclared) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+
+                            if (showUndeclared) {
+                                SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)) {
+                                    undeclaredCats.forEachIndexed { idx, cat ->
+                                        PermissionCategoryControlRow(
+                                            packageName = app.packageName,
+                                            category = cat,
+                                            title = s.categoryLabel(cat),
+                                            desc = s.categoryDesc(cat),
+                                            localRuntimeGranted = app.grantedSensitiveCategories.contains(cat),
+                                            catState = liveByCat[cat],
+                                            isUndeclared = true,
+                                            isAutoRevoke = guard.autoRevokeOnBg.contains(cat),
+                                            isStrictLocked = guard.lockedDeny.contains(cat),
+                                            pendingPermKeys = state.pendingPermKeys,
+                                            onAction = { action -> vm.setAppPermissionAction(app.packageName, cat, action) },
+                                            onToggleAutoRevoke = { vm.toggleAppAutoRevoke(app.packageName, cat, !guard.autoRevokeOnBg.contains(cat)) },
+                                            onToggleStrictLock = { vm.toggleAppStrictLock(app.packageName, cat, !guard.lockedDeny.contains(cat)) },
+                                        )
+                                        if (idx < undeclaredCats.lastIndex) SiloHairline()
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -822,10 +1291,8 @@ private fun AppControlSheet(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
-                            if (freezerEntry == null) {
-                                vm.setFreezerEntry(app.uid, FreezerEntry(packageName = app.packageName, mode = currentMode))
-                            }
-                            vm.freezeUidNow(app.uid)
+                            val entry = freezerEntry ?: FreezerEntry(packageName = app.packageName, mode = currentMode)
+                            vm.ensureEntryAndFreeze(app.uid, entry)
                         },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(12.dp),
@@ -843,25 +1310,43 @@ private fun AppControlSheet(
 
 @Composable
 private fun PermissionCategoryControlRow(
+    packageName: String,
+    category: String,
     title: String,
     desc: String,
-    runtimeGranted: Boolean,
-    appopsMode: String,
-    runningNow: Boolean,
-    lastAccess: String?,
+    localRuntimeGranted: Boolean,
+    catState: CategoryPermLiveState?,
+    isUndeclared: Boolean,
     isAutoRevoke: Boolean,
     isStrictLocked: Boolean,
+    pendingPermKeys: Set<String>,
     onAction: (String) -> Unit,
     onToggleAutoRevoke: () -> Unit,
     onToggleStrictLock: () -> Unit,
 ) {
     val s = LocalSiloStrings.current
+    val runningNow = catState?.runningNow == true
+    val systemFixed = catState?.systemFixed == true
+    val lastAccess = catState?.effectiveLastAccess
+    val uiMode = resolvePermUiMode(category, catState, localRuntimeGranted)
+    val supportsFg = resolveSupportsForeground(category, catState)
+
+    val rowPrefix = "$packageName:$category:"
+    val allowPending = pendingPermKeys.contains("${rowPrefix}allow") || pendingPermKeys.contains("${rowPrefix}default")
+    val fgPending = pendingPermKeys.contains("${rowPrefix}foreground")
+    val ignorePending = pendingPermKeys.contains("${rowPrefix}ignore")
+    val revokePending = pendingPermKeys.contains("${rowPrefix}revoke") || pendingPermKeys.contains("${rowPrefix}deny")
+    val autoGuardPending = pendingPermKeys.contains("${rowPrefix}guard_auto")
+    val lockGuardPending = pendingPermKeys.contains("${rowPrefix}guard_lock")
+    val actionBusy = allowPending || fgPending || ignorePending || revokePending
+    val guardBusy = autoGuardPending || lockGuardPending
+
     val (statusLabel, statusColor) = when {
         runningNow -> s.permStateRunning to SiloCrimson
-        appopsMode == "ignore" -> s.permStateIgnored to SiloEmerald
-        appopsMode == "deny" -> s.permStateDenied to SiloEmerald
-        appopsMode == "foreground" -> s.permStateForeground to SiloCyan
-        runtimeGranted -> s.permStateGranted to SiloAmber
+        uiMode == PermEffectiveUiMode.REVOKED -> s.permStateDenied to SiloEmerald
+        uiMode == PermEffectiveUiMode.FAKE_EMPTY -> s.permStateIgnored to SiloEmerald
+        uiMode == PermEffectiveUiMode.FOREGROUND -> s.permStateForeground to SiloCyan
+        uiMode == PermEffectiveUiMode.NORMAL -> s.permStateGranted to SiloAmber
         else -> s.permStateDenied to MaterialTheme.colorScheme.onSurfaceVariant
     }
 
@@ -874,11 +1359,25 @@ private fun PermissionCategoryControlRow(
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Top,
         ) {
             Column(Modifier.weight(1f).padding(end = 8.dp)) {
                 Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                 Text(desc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (systemFixed) {
+                    Text(
+                        s.permSystemFixedNote,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SiloAmber,
+                    )
+                }
+                if (isUndeclared) {
+                    Text(
+                        s.undeclaredPermHint,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                    )
+                }
                 if (!lastAccess.isNullOrBlank()) {
                     Text(
                         "${s.lastAccessPrefix}: $lastAccess",
@@ -887,47 +1386,67 @@ private fun PermissionCategoryControlRow(
                     )
                 }
             }
-            MiniTag(statusLabel, statusColor)
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                MiniTag(statusLabel, statusColor)
+                if (systemFixed) {
+                    MiniTag(s.permSystemFixedBadge, SiloAmber)
+                }
+            }
         }
 
-        // 4 real action pills: Normal / Foreground / Ignore / Revoke (pm revoke + ignore)
+        // Mutually-exclusive action pills: Normal / [While Open if supported] / Fake Empty / Revoke
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             SmallActionPill(
                 text = s.permActionNormal,
-                active = appopsMode == "default" || appopsMode == "allow",
+                active = uiMode.isNormalPillActive,
                 accent = MaterialTheme.colorScheme.primary,
+                enabled = !actionBusy,
+                loading = allowPending,
                 modifier = Modifier.weight(1f),
                 onClick = { onAction("allow") },
             )
-            SmallActionPill(
-                text = s.permActionFg,
-                active = appopsMode == "foreground",
-                accent = SiloCyan,
-                modifier = Modifier.weight(1f),
-                onClick = { onAction("foreground") },
-            )
+            if (supportsFg || uiMode == PermEffectiveUiMode.FOREGROUND) {
+                SmallActionPill(
+                    text = s.permActionFg,
+                    active = uiMode.isForegroundPillActive,
+                    accent = SiloCyan,
+                    enabled = !actionBusy && supportsFg,
+                    loading = fgPending,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onAction("foreground") },
+                )
+            }
             SmallActionPill(
                 text = s.permActionIgnore,
-                active = appopsMode == "ignore",
+                active = uiMode.isFakeEmptyPillActive,
                 accent = SiloEmerald,
+                enabled = !actionBusy,
+                loading = ignorePending,
                 modifier = Modifier.weight(1f),
                 onClick = { onAction("ignore") },
             )
             SmallActionPill(
                 text = s.permActionRevoke,
-                active = !runtimeGranted && (appopsMode == "ignore" || appopsMode == "deny"),
+                active = uiMode.isRevokedPillActive,
                 accent = SiloCrimson,
+                enabled = !actionBusy,
+                loading = revokePending,
                 modifier = Modifier.weight(1f),
                 onClick = { onAction("revoke") },
             )
         }
 
-        // Daemon Enforcer toggles: Auto-Revoke on Close & Strict Lock
+        // Mutually-exclusive Daemon Enforcer toggles: Auto-Revoke & Strict Lock
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             EnforcerPill(
                 text = s.enforcerAutoRevoke,
                 active = isAutoRevoke,
                 accent = SiloCyan,
+                enabled = !guardBusy,
+                loading = autoGuardPending,
                 modifier = Modifier.weight(1f),
                 onClick = onToggleAutoRevoke,
             )
@@ -935,6 +1454,8 @@ private fun PermissionCategoryControlRow(
                 text = s.enforcerStrictLock,
                 active = isStrictLocked,
                 accent = SiloAmber,
+                enabled = !guardBusy,
+                loading = lockGuardPending,
                 modifier = Modifier.weight(1f),
                 onClick = onToggleStrictLock,
             )
@@ -947,15 +1468,89 @@ private fun SmallActionPill(
     text: String,
     active: Boolean,
     accent: Color,
+    enabled: Boolean,
+    loading: Boolean,
     modifier: Modifier,
     onClick: () -> Unit,
 ) {
     Surface(
-        modifier = modifier.clip(RoundedCornerShape(9.dp)).clickable(onClick = onClick),
-        shape = RoundedCornerShape(9.dp),
-        color = if (active) accent.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+        onClick = onClick,
+        enabled = enabled && !loading,
+        modifier = modifier
+            .defaultMinSize(minHeight = 40.dp)
+            .minimumInteractiveComponentSize()
+            .alpha(if (enabled || loading) 1f else 0.55f),
+        shape = RoundedCornerShape(10.dp),
+        color = if (active) accent.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
     ) {
-        Box(Modifier.padding(vertical = 6.dp, horizontal = 3.dp), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .defaultMinSize(minHeight = 40.dp)
+                .padding(vertical = 8.dp, horizontal = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = accent,
+                )
+            } else {
+                Text(
+                    text,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EnforcerPill(
+    text: String,
+    active: Boolean,
+    accent: Color,
+    enabled: Boolean,
+    loading: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled && !loading,
+        modifier = modifier
+            .defaultMinSize(minHeight = 40.dp)
+            .minimumInteractiveComponentSize()
+            .alpha(if (enabled || loading) 1f else 0.55f),
+        shape = RoundedCornerShape(10.dp),
+        color = if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.4f),
+    ) {
+        Row(
+            modifier = Modifier
+                .defaultMinSize(minHeight = 40.dp)
+                .padding(vertical = 8.dp, horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = accent,
+                )
+            } else {
+                Icon(
+                    if (active) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                    contentDescription = null,
+                    tint = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+            Spacer(Modifier.width(5.dp))
             Text(
                 text,
                 style = MaterialTheme.typography.labelSmall,
@@ -968,38 +1563,3 @@ private fun SmallActionPill(
     }
 }
 
-@Composable
-private fun EnforcerPill(
-    text: String,
-    active: Boolean,
-    accent: Color,
-    modifier: Modifier,
-    onClick: () -> Unit,
-) {
-    Surface(
-        modifier = modifier.clip(RoundedCornerShape(9.dp)).clickable(onClick = onClick),
-        shape = RoundedCornerShape(9.dp),
-        color = if (active) accent.copy(alpha = 0.18f) else Color.Transparent,
-    ) {
-        Row(
-            modifier = Modifier.padding(vertical = 5.dp, horizontal = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Icon(
-                if (active) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
-                contentDescription = null,
-                tint = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                modifier = Modifier.size(13.dp),
-            )
-            Spacer(Modifier.width(4.dp))
-            Text(
-                text,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}

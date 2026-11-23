@@ -1,7 +1,7 @@
 name: Build & Release Silo (Daemon + KSU Module + APK)
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -68,6 +68,7 @@ jobs:
           sh -n module/service.sh
           sh -n module/action.sh
           sh -n module/uninstall.sh
+          bash -n scripts/build_module.sh
           chmod +x scripts/build_module.sh
           ./scripts/build_module.sh \
             daemon/target/aarch64-unknown-linux-musl/release/silod \
@@ -75,11 +76,18 @@ jobs:
 
       - name: Verify Zero-Mount Stealth Invariant on Module ZIP
         run: |
-          if unzip -l dist/silo-ksu-module.zip | grep -qE '[[:space:]](system|vendor|product)/'; then
-            echo "::error::Stealth invariant violated: /system or /vendor overlay found in module ZIP!"
+          ZIP_ENTRIES="$(unzip -Z1 dist/silo-ksu-module.zip)"
+          if printf '%s\n' "$ZIP_ENTRIES" | grep -qiE '^(\./)?(system|vendor|product|system_ext|odm)(/|$)'; then
+            echo "::error::Stealth invariant violated: forbidden overlay (system/vendor/product/system_ext/odm) found in module ZIP!"
             exit 1
           fi
-          echo "[OK] Zero-mount stealth invariant verified."
+          for req in module.prop customize.sh service.sh action.sh uninstall.sh bin/silod; do
+            if ! printf '%s\n' "$ZIP_ENTRIES" | grep -qxF "$req"; then
+              echo "::error::Required module entry missing from ZIP: $req"
+              exit 1
+            fi
+          done
+          echo "[OK] Zero-mount stealth invariant & required module entries verified."
 
       - name: Upload KernelSU Module Artifact
         uses: actions/upload-artifact@v4
@@ -112,7 +120,8 @@ jobs:
           SILO_KEYSTORE_BASE64: ${{ secrets.SILO_KEYSTORE_BASE64 }}
         run: |
           if [ -n "$SILO_KEYSTORE_BASE64" ]; then
-            echo "$SILO_KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/silo-release.jks"
+            printf '%s' "$SILO_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "${RUNNER_TEMP}/silo-release.jks"
+            chmod 0600 "${RUNNER_TEMP}/silo-release.jks"
             echo "SILO_KEYSTORE_PATH=${RUNNER_TEMP}/silo-release.jks" >> "$GITHUB_ENV"
             echo "Using custom release keystore from repository secrets."
           else
@@ -137,9 +146,10 @@ jobs:
           cp "$APK_PATH" dist/Silo-release.apk
 
           AAPT2="$(find "${ANDROID_HOME}/build-tools" -name aapt2 | sort -V | tail -n 1)"
+          test -x "$AAPT2" || { echo "::error::aapt2 binary not found under ANDROID_HOME!"; exit 1; }
           echo "=== Merged APK Permissions ($AAPT2) ==="
           "$AAPT2" dump permissions dist/Silo-release.apk
-          if "$AAPT2" dump permissions dist/Silo-release.apk | grep -q 'android.permission.INTERNET'; then
+          if "$AAPT2" dump permissions dist/Silo-release.apk | grep -Fq 'android.permission.INTERNET'; then
             echo "::error::Strict Offline-First violated: android.permission.INTERNET detected in APK!"
             exit 1
           fi
@@ -156,6 +166,8 @@ jobs:
     name: "Publish GitHub Release"
     needs: [ daemon-and-module, android-app ]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -168,43 +180,68 @@ jobs:
 
       - name: Prepare versioned release files & SHA256SUMS
         id: meta
+        env:
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
-          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
-            TAG="${{ github.event.inputs.release_tag }}"
+          elif [ -n "${INPUT_RELEASE_TAG:-}" ]; then
+            TAG="$INPUT_RELEASE_TAG"
           else
-            TAG="v3.0.0-$(date -u +%Y%m%d-%H%M)"
+            BASE_VERSION="$( (grep -m1 '^version=' module/module.prop || true) | cut -d= -f2- | tr -d '\r\n[:space:]')"
+            if [ -z "$BASE_VERSION" ]; then
+              echo "::error::Failed to derive version from module/module.prop"
+              exit 1
+            fi
+            case "$BASE_VERSION" in
+              v*) ;;
+              *) BASE_VERSION="v${BASE_VERSION}" ;;
+            esac
+            TAG="${BASE_VERSION}-$(date -u +%Y%m%d-%H%M)"
           fi
+
+          if [[ "$TAG" == *".."* ]] || [[ "$TAG" == *$'\n'* ]] || [[ "$TAG" == *$'\r'* ]] || [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]]; then
+            echo "::error::Invalid or unsafe release tag format: ${TAG}"
+            exit 1
+          fi
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
           mkdir -p release_out
-          cp release_staging/silo-apk/Silo-release.apk "release_out/Silo-${TAG}.apk"
-          cp release_staging/silo-ksu-module/silo-ksu-module.zip "release_out/silo-ksu-module-${TAG}.zip"
+          cp -- release_staging/silo-apk/Silo-release.apk "release_out/Silo-${TAG}.apk"
+          cp -- release_staging/silo-ksu-module/silo-ksu-module.zip "release_out/silo-ksu-module-${TAG}.zip"
           (
             cd release_out
-            sha256sum "Silo-${TAG}.apk" "silo-ksu-module-${TAG}.zip" > SHA256SUMS.txt
+            sha256sum -- "Silo-${TAG}.apk" "silo-ksu-module-${TAG}.zip" > SHA256SUMS.txt
           )
           cat release_out/SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
         run: |
-          TAG="${{ steps.meta.outputs.tag }}"
-          PRE_FLAG=""
-          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
-            PRE_FLAG="--prerelease"
+          GH_FLAGS=()
+          if [ "${INPUT_PRERELEASE:-}" = "true" ]; then
+            GH_FLAGS+=(--prerelease)
           fi
-          gh release create "$TAG" \
-            "release_out/Silo-${TAG}.apk" \
-            "release_out/silo-ksu-module-${TAG}.zip" \
-            "release_out/SHA256SUMS.txt" \
-            --title "Silo ${TAG}" \
-            --notes "Silo ${TAG} — Zero-panic, zero-gimmick Linux 6.x kernel privacy & security suite (static ARM64 Rust \`silod\` KernelSU Module + strict offline-first Kotlin/Compose APK with verified zero \`INTERNET\` permission). v3.0.0 upgrades: real-time separated Mic/Camera live state (\`dumpsys sensor_privacy\`), honest per-app Permissions & AppOps controller (\`pm revoke\` + 4-mode AppOps + Auto-Revoke on Close & Strict Lock Enforcer), Global Permission Audit + Bulk Revoke, Real-Time Privacy Access Timeline (\`dumpsys appops --op\`), granted-based Risk Breakdown & Mitigation, GrapheneOS-aligned Radio Privacy & safe USB/ADB Lockscreen Guard, 1-tap non-destructive Panic Lockdown, and extra reversible kernel sysctls. Note: update BOTH the KernelSU module ZIP (and reboot) and the APK." \
-            $PRE_FLAG || \
-          gh release upload "$TAG" \
-            "release_out/Silo-${TAG}.apk" \
-            "release_out/silo-ksu-module-${TAG}.zip" \
-            "release_out/SHA256SUMS.txt" \
-            --clobber
+          if [[ "${GITHUB_REF:-}" != refs/tags/* ]] && [ -n "${GITHUB_SHA:-}" ]; then
+            GH_FLAGS+=(--target "$GITHUB_SHA")
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "release_out/Silo-${RELEASE_TAG}.apk" \
+              "release_out/silo-ksu-module-${RELEASE_TAG}.zip" \
+              "release_out/SHA256SUMS.txt" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "release_out/Silo-${RELEASE_TAG}.apk" \
+              "release_out/silo-ksu-module-${RELEASE_TAG}.zip" \
+              "release_out/SHA256SUMS.txt" \
+              --title "Silo ${RELEASE_TAG}" \
+              --notes "Silo ${RELEASE_TAG} — Zero-panic, zero-gimmick Linux 6.x kernel privacy & security suite (static ARM64 Rust \`silod\` KernelSU Module + strict offline-first Kotlin/Compose APK with verified zero \`INTERNET\` permission). Note: update BOTH the KernelSU module ZIP (and reboot) and the APK." \
+              "${GH_FLAGS[@]}"
+          fi

@@ -2,7 +2,15 @@ package dev.silo.app.ipc
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+
+/** Shared JSON codec aligned with silod's snake_case serde protocol. */
+val SiloJson: Json = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+    explicitNulls = false
+}
 
 @Serializable
 enum class FirewallMode {
@@ -82,6 +90,7 @@ data class FirewallConfig(
     @SerialName("sock_destroy_on_block") val sockDestroyOnBlock: Boolean = true,
     val rules: Map<Int, AppFirewallRule> = emptyMap(),
     @SerialName("ip_blocklist") val ipBlocklist: List<String> = emptyList(),
+    @SerialName("panic_lockdown_active") val panicLockdownActive: Boolean = false,
 )
 
 @Serializable
@@ -128,7 +137,28 @@ data class AppPermGuard(
     @SerialName("auto_revoke_on_bg") val autoRevokeOnBg: List<String> = emptyList(),
     @SerialName("locked_deny") val lockedDeny: List<String> = emptyList(),
 ) {
-    fun totalCount(): Int = autoRevokeOnBg.size + lockedDeny.size
+    /** Distinct union of guarded categories so overlapping entries are never double-counted. */
+    fun totalCount(): Int = (autoRevokeOnBg.asSequence() + lockedDeny.asSequence()).toSet().size
+
+    /** Enforces mutual exclusivity matching daemon contract (`locked_deny` takes precedence). */
+    fun normalized(): AppPermGuard {
+        val locked = lockedDeny.distinct()
+        val lockedSet = locked.toSet()
+        val auto = autoRevokeOnBg.distinct().filterNot { it in lockedSet }
+        return copy(autoRevokeOnBg = auto, lockedDeny = locked)
+    }
+
+    fun withAutoRevoke(category: String, enabled: Boolean): AppPermGuard {
+        val nextAuto = if (enabled) (autoRevokeOnBg + category).distinct() else autoRevokeOnBg.filter { it != category }
+        val nextLocked = if (enabled) lockedDeny.filter { it != category } else lockedDeny
+        return copy(autoRevokeOnBg = nextAuto, lockedDeny = nextLocked)
+    }
+
+    fun withStrictLock(category: String, enabled: Boolean): AppPermGuard {
+        val nextLocked = if (enabled) (lockedDeny + category).distinct() else lockedDeny.filter { it != category }
+        val nextAuto = if (enabled) autoRevokeOnBg.filter { it != category } else autoRevokeOnBg
+        return copy(autoRevokeOnBg = nextAuto, lockedDeny = nextLocked)
+    }
 }
 
 @Serializable
@@ -228,8 +258,16 @@ data class CategoryPermLiveState(
     val category: String = "",
     @SerialName("appops_mode") val appopsMode: String = "default",
     @SerialName("last_access") val lastAccess: String? = null,
+    @SerialName("last_access_ago") val lastAccessAgo: String? = null,
     @SerialName("running_now") val runningNow: Boolean = false,
-)
+    @SerialName("runtime_granted") val runtimeGranted: Boolean? = null,
+    @SerialName("has_runtime_perms") val hasRuntimePerms: Boolean = true,
+    @SerialName("supports_foreground") val supportsForeground: Boolean = true,
+    @SerialName("system_fixed") val systemFixed: Boolean = false,
+) {
+    val effectiveLastAccess: String?
+        get() = lastAccess?.takeIf { it.isNotBlank() } ?: lastAccessAgo?.takeIf { it.isNotBlank() }
+}
 
 @Serializable
 data class AppLivePermissions(
@@ -291,6 +329,7 @@ data class DaemonStatus(
     @SerialName("temp_unblocks_remaining") val tempUnblocksRemaining: Map<Int, Long> = emptyMap(),
     val capabilities: KernelCapabilities = KernelCapabilities(),
     @SerialName("last_firewall_error") val lastFirewallError: String? = null,
+    @SerialName("panic_lockdown_active") val panicLockdownActive: Boolean = false,
 )
 
 @Serializable

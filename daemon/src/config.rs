@@ -8,6 +8,9 @@ use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const VALID_PERM_CATEGORIES: &[&str] = &[
@@ -181,6 +184,10 @@ impl AppFirewallRule {
 pub struct FirewallConfig {
     pub enabled: bool,
     pub mode: FirewallMode,
+    /// True while 1-tap Panic Lockdown is active (blocks ALL non-protected user UIDs unconditionally,
+    /// overriding saved per-app allow rules until explicitly cleared).
+    #[serde(default)]
+    pub panic_lockdown_active: bool,
     pub block_action: BlockAction,
     /// Automatically block newly installed apps when in DefaultAllow mode if enabled.
     pub block_new_apps: bool,
@@ -213,6 +220,7 @@ impl Default for FirewallConfig {
         Self {
             enabled: false,
             mode: FirewallMode::DefaultAllow,
+            panic_lockdown_active: false,
             block_action: BlockAction::Reject,
             block_new_apps: false,
             isolate_lan: false,
@@ -467,6 +475,9 @@ impl SiloConfig {
         if self.firewall.ttl_value == 0 {
             self.firewall.ttl_value = 64;
         }
+        if !self.firewall.enabled || self.firewall.mode != FirewallMode::DefaultDeny {
+            self.firewall.panic_lockdown_active = false;
+        }
 
         self.firewall.rules.retain(|&uid, rule| {
             !is_protected_uid(uid) && !is_protected_package(&rule.package_name)
@@ -481,12 +492,14 @@ impl SiloConfig {
             if !validate_package_name(pkg) || is_protected_package(pkg) {
                 return false;
             }
-            guard.auto_revoke_on_bg.retain(|c| is_valid_perm_category(c));
-            guard.auto_revoke_on_bg.sort();
-            guard.auto_revoke_on_bg.dedup();
             guard.locked_deny.retain(|c| is_valid_perm_category(c));
             guard.locked_deny.sort();
             guard.locked_deny.dedup();
+            guard
+                .auto_revoke_on_bg
+                .retain(|c| is_valid_perm_category(c) && !guard.locked_deny.contains(c));
+            guard.auto_revoke_on_bg.sort();
+            guard.auto_revoke_on_bg.dedup();
             !guard.is_empty()
         });
 
@@ -547,39 +560,64 @@ impl SiloConfig {
             SecurityPreset::Safe => {
                 self.firewall.enabled = false;
                 self.firewall.mode = FirewallMode::DefaultAllow;
+                self.firewall.panic_lockdown_active = false;
+                self.firewall.block_action = BlockAction::Reject;
                 self.firewall.isolate_lan = false;
                 self.firewall.dns_leak_guard = false;
                 self.firewall.ipv6_leak_guard = false;
                 self.firewall.block_cleartext_http_global = false;
                 self.firewall.anti_port_scan = false;
                 self.firewall.normalize_ttl_hl = false;
+                self.firewall.ttl_value = 64;
                 self.firewall.block_new_apps = false;
-                self.hardening.enabled = false;
                 self.freezer.enabled = false;
                 self.scopes.auto_clear_clipboard = false;
+                self.scopes.clipboard_clear_secs = 45;
+                self.hardening = HardeningConfig::default();
+                self.automation.auto_reboot_enabled = false;
+                self.automation.wifi_auto_off_enabled = false;
+                self.automation.bluetooth_auto_off_enabled = false;
                 self.automation.sensors_off_on_lock = false;
                 self.automation.usb_adb_lock_guard = false;
             }
             SecurityPreset::Balanced => {
                 self.firewall.enabled = true;
                 self.firewall.mode = FirewallMode::DefaultAllow;
+                self.firewall.panic_lockdown_active = false;
+                self.firewall.block_action = BlockAction::Reject;
                 self.firewall.isolate_lan = true;
                 self.firewall.dns_leak_guard = true;
                 self.firewall.ipv6_leak_guard = true;
                 self.firewall.anti_port_scan = true;
                 self.firewall.block_cleartext_http_global = false;
                 self.firewall.normalize_ttl_hl = false;
+                self.firewall.ttl_value = 64;
                 self.firewall.block_new_apps = false;
                 self.hardening.enabled = true;
+                self.hardening.hide_kernel_pointers = true;
+                self.hardening.restrict_perf_events = true;
+                self.hardening.disable_unprivileged_bpf = true;
+                self.hardening.harden_bpf_jit = true;
+                self.hardening.disable_suid_dumpable = true;
+                self.hardening.protect_fs_links_fifos = true;
+                self.hardening.restrict_dmesg = true;
                 self.hardening.disable_tcp_timestamps = true;
+                self.hardening.harden_network_stack = true;
                 self.hardening.harden_memory_and_ptrace = true;
                 self.hardening.ipv6_privacy_extensions = true;
                 self.scopes.auto_clear_clipboard = true;
                 self.scopes.clipboard_clear_secs = 60;
+                self.automation.auto_reboot_enabled = false;
+                self.automation.wifi_auto_off_enabled = false;
+                self.automation.bluetooth_auto_off_enabled = false;
+                self.automation.sensors_off_on_lock = false;
+                self.automation.usb_adb_lock_guard = false;
             }
             SecurityPreset::Hardened => {
                 self.firewall.enabled = true;
                 self.firewall.mode = FirewallMode::DefaultAllow;
+                self.firewall.panic_lockdown_active = false;
+                self.firewall.block_action = BlockAction::Reject;
                 self.firewall.isolate_lan = true;
                 self.firewall.dns_leak_guard = true;
                 self.firewall.ipv6_leak_guard = true;
@@ -602,28 +640,38 @@ impl SiloConfig {
                 self.hardening.ipv6_privacy_extensions = true;
                 self.scopes.auto_clear_clipboard = true;
                 self.scopes.clipboard_clear_secs = 45;
+                self.automation.auto_reboot_enabled = false;
+                self.automation.wifi_auto_off_enabled = false;
+                self.automation.bluetooth_auto_off_enabled = false;
                 self.automation.sensors_off_on_lock = true;
+                self.automation.usb_adb_lock_guard = false;
             }
             SecurityPreset::Paranoid => {
                 self.apply_preset(SecurityPreset::Hardened);
                 self.firewall.mode = FirewallMode::DefaultDeny;
+                self.firewall.panic_lockdown_active = false;
                 self.firewall.block_action = BlockAction::Reject;
                 self.scopes.clipboard_clear_secs = 30;
+                self.automation.auto_reboot_enabled = false;
                 self.automation.wifi_auto_off_enabled = true;
                 self.automation.bluetooth_auto_off_enabled = true;
+                self.automation.sensors_off_on_lock = true;
                 self.automation.usb_adb_lock_guard = true;
             }
         }
     }
 
     pub fn load_or_default(path: &Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str::<SiloConfig>(&raw) {
+        match fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<SiloConfig>(&bytes) {
                 Ok(mut cfg) => {
                     let _ = cfg.sanitize();
                     cfg
                 }
-                Err(_) => Self::default(),
+                Err(_) => {
+                    backup_corrupt_config(path, &bytes);
+                    Self::default()
+                }
             },
             Err(_) => Self::default(),
         }
@@ -631,11 +679,20 @@ impl SiloConfig {
 
     pub fn save_atomic(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {}", e))?;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("create_dir_all failed: {}", e))?;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
 
-        let tmp_path = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+        let seq = CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = PathBuf::from(format!(
+            "{}.tmp.{}.{}",
+            path.display(),
+            std::process::id(),
+            seq
+        ));
         let serialized = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serialize config failed: {}", e))?;
 
@@ -653,13 +710,59 @@ impl SiloConfig {
                 let _ = fs::remove_file(&tmp_path);
                 format!("write/sync config failed: {}", e)
             })?;
+        drop(file);
 
         fs::rename(&tmp_path, path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             format!("atomic rename config failed: {}", e)
         })?;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+
+        // Durability (D-26): fsync parent directory so atomic rename survives power loss / BFU reboot
+        if let Some(parent) = path.parent() {
+            let dir_path = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(dir) = fs::File::open(dir_path) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
+    }
+}
+
+fn backup_corrupt_config(path: &Path, raw_bytes: &[u8]) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut backup_os = path.as_os_str().to_os_string();
+    backup_os.push(format!(".corrupt.{}", ts));
+    let backup_path = PathBuf::from(backup_os);
+
+    if fs::rename(path, &backup_path).is_ok() {
+        let _ = fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600));
+        if let Some(parent) = backup_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+        return;
+    }
+
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&backup_path)
+    {
+        let _ = f.write_all(raw_bytes);
+        let _ = f.sync_all();
     }
 }
 
@@ -912,6 +1015,159 @@ mod tests {
 
         let loaded = SiloConfig::load_or_default(&path);
         assert_eq!(loaded, cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preset_reset_matrix_leaves_zero_stale_toggles() {
+        let mut cfg = SiloConfig::default();
+        cfg.apply_preset(SecurityPreset::Paranoid);
+        cfg.firewall.panic_lockdown_active = true;
+        cfg.automation.auto_reboot_enabled = true;
+        cfg.hardening.tcp_congestion = "bbr".to_string();
+        cfg.hardening.default_qdisc = "fq_codel".to_string();
+        cfg.freezer.enabled = true;
+
+        // Paranoid -> Balanced
+        cfg.apply_preset(SecurityPreset::Balanced);
+        assert!(cfg.firewall.enabled);
+        assert_eq!(cfg.firewall.mode, FirewallMode::DefaultAllow);
+        assert!(!cfg.firewall.panic_lockdown_active);
+        assert!(!cfg.firewall.block_cleartext_http_global);
+        assert!(!cfg.firewall.normalize_ttl_hl);
+        assert!(!cfg.firewall.block_new_apps);
+        assert!(cfg.hardening.enabled);
+        assert!(cfg.hardening.hide_kernel_pointers);
+        assert!(cfg.hardening.restrict_perf_events);
+        assert!(cfg.hardening.disable_unprivileged_bpf);
+        assert!(cfg.hardening.harden_bpf_jit);
+        assert!(cfg.hardening.disable_suid_dumpable);
+        assert!(cfg.hardening.protect_fs_links_fifos);
+        assert!(cfg.hardening.restrict_dmesg);
+        assert!(cfg.hardening.disable_tcp_timestamps);
+        assert!(cfg.hardening.harden_network_stack);
+        assert!(cfg.hardening.harden_memory_and_ptrace);
+        assert!(cfg.hardening.ipv6_privacy_extensions);
+        assert!(!cfg.automation.auto_reboot_enabled);
+        assert!(!cfg.automation.wifi_auto_off_enabled);
+        assert!(!cfg.automation.bluetooth_auto_off_enabled);
+        assert!(!cfg.automation.sensors_off_on_lock);
+        assert!(!cfg.automation.usb_adb_lock_guard);
+        assert!(cfg.scopes.auto_clear_clipboard);
+        assert_eq!(cfg.scopes.clipboard_clear_secs, 60);
+
+        // Paranoid -> Hardened
+        cfg.apply_preset(SecurityPreset::Paranoid);
+        cfg.firewall.panic_lockdown_active = true;
+        cfg.apply_preset(SecurityPreset::Hardened);
+        assert_eq!(cfg.firewall.mode, FirewallMode::DefaultAllow);
+        assert!(!cfg.firewall.panic_lockdown_active);
+        assert!(cfg.automation.sensors_off_on_lock);
+        assert!(!cfg.automation.wifi_auto_off_enabled);
+        assert!(!cfg.automation.bluetooth_auto_off_enabled);
+        assert!(!cfg.automation.usb_adb_lock_guard);
+        assert!(!cfg.automation.auto_reboot_enabled);
+
+        // Paranoid -> Safe
+        cfg.apply_preset(SecurityPreset::Paranoid);
+        cfg.firewall.panic_lockdown_active = true;
+        cfg.hardening.tcp_congestion = "bbr".to_string();
+        cfg.freezer.enabled = true;
+        cfg.apply_preset(SecurityPreset::Safe);
+        assert!(!cfg.firewall.enabled);
+        assert_eq!(cfg.firewall.mode, FirewallMode::DefaultAllow);
+        assert!(!cfg.firewall.panic_lockdown_active);
+        assert!(!cfg.freezer.enabled);
+        assert!(!cfg.hardening.enabled);
+        assert!(cfg.hardening.tcp_congestion.is_empty());
+        assert!(cfg.hardening.default_qdisc.is_empty());
+        assert!(!cfg.scopes.auto_clear_clipboard);
+        assert!(!cfg.automation.auto_reboot_enabled);
+        assert!(!cfg.automation.wifi_auto_off_enabled);
+        assert!(!cfg.automation.bluetooth_auto_off_enabled);
+        assert!(!cfg.automation.sensors_off_on_lock);
+        assert!(!cfg.automation.usb_adb_lock_guard);
+    }
+
+    #[test]
+    fn sanitize_enforces_guard_mutual_exclusivity_and_panic_invariant() {
+        let mut cfg = SiloConfig::default();
+        cfg.firewall.enabled = false;
+        cfg.firewall.mode = FirewallMode::DefaultDeny;
+        cfg.firewall.panic_lockdown_active = true;
+        cfg.scopes.guards.insert(
+            "com.example.chat".to_string(),
+            AppPermGuard {
+                locked_deny: vec![
+                    "camera".to_string(),
+                    "invalid_cat".to_string(),
+                    "camera".to_string(),
+                ],
+                auto_revoke_on_bg: vec![
+                    "camera".to_string(),
+                    "microphone".to_string(),
+                    "microphone".to_string(),
+                ],
+            },
+        );
+        cfg.sanitize().unwrap();
+        assert!(!cfg.firewall.panic_lockdown_active);
+        let guard = cfg.scopes.guards.get("com.example.chat").unwrap();
+        assert_eq!(guard.locked_deny, vec!["camera".to_string()]);
+        assert_eq!(guard.auto_revoke_on_bg, vec!["microphone".to_string()]);
+    }
+
+    #[test]
+    fn load_or_default_backs_up_corrupt_config_with_0600() {
+        let dir = std::env::temp_dir().join(format!("silo_corrupt_cfg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Case 1: Malformed JSON
+        let path1 = dir.join("config.json");
+        fs::write(&path1, b"{corrupt!!!").unwrap();
+        let loaded1 = SiloConfig::load_or_default(&path1);
+        assert_eq!(loaded1, SiloConfig::default());
+
+        let backups1: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("config.json.corrupt."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(backups1.len(), 1);
+        assert_eq!(fs::read(&backups1[0]).unwrap(), b"{corrupt!!!");
+        let mode1 = fs::metadata(&backups1[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode1, 0o600);
+
+        // Case 2: Non-UTF-8 binary corruption
+        let path2 = dir.join("binary.json");
+        let raw_bin = [0xffu8, 0xfe, 0x00, 0x80];
+        fs::write(&path2, raw_bin).unwrap();
+        let loaded2 = SiloConfig::load_or_default(&path2);
+        assert_eq!(loaded2, SiloConfig::default());
+
+        let backups2: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("binary.json.corrupt."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(backups2.len(), 1);
+        assert_eq!(fs::read(&backups2[0]).unwrap(), raw_bin);
+        let mode2 = fs::metadata(&backups2[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

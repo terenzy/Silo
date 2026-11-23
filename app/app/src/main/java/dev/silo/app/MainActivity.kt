@@ -12,9 +12,12 @@ import androidx.compose.material.icons.automirrored.rounded.ShowChart
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -26,6 +29,7 @@ import dev.silo.app.ui.i18n.LocalSiloStrings
 import dev.silo.app.ui.i18n.resolveStrings
 import dev.silo.app.ui.screens.*
 import dev.silo.app.ui.theme.SiloTheme
+import java.util.Locale
 
 private enum class SiloNavTab(val icon: ImageVector) {
     HOME(Icons.Rounded.Shield),
@@ -48,7 +52,13 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
     val state by vm.ui.collectAsStateWithLifecycle()
-    val strings = remember(state.languagePref) { resolveStrings(state.languagePref) }
+    val configuration = LocalConfiguration.current
+    val activeLocale = remember(configuration) {
+        configuration.locales.takeIf { !it.isEmpty }?.get(0) ?: Locale.getDefault()
+    }
+    val strings = remember(state.languagePref, activeLocale) {
+        resolveStrings(state.languagePref, activeLocale)
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
 
     // Real-time lifecycle sync: immediately reloads live Mic/Camera sensor privacy,
@@ -70,10 +80,11 @@ private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
 
     SiloTheme(themePref = state.themePref) {
         CompositionLocalProvider(LocalSiloStrings provides strings) {
-            var currentTab by remember { mutableStateOf(SiloNavTab.HOME) }
+            var currentTabName by rememberSaveable { mutableStateOf(SiloNavTab.HOME.name) }
+            val currentTab = SiloNavTab.entries.firstOrNull { it.name == currentTabName } ?: SiloNavTab.HOME
             val snackbarHostState = remember { SnackbarHostState() }
 
-            LaunchedEffect(state.snackbarMessage) {
+            LaunchedEffect(state.snackbarSeq, state.snackbarMessage) {
                 val msg = state.snackbarMessage
                 if (msg != null) {
                     snackbarHostState.showSnackbar(msg)
@@ -101,7 +112,7 @@ private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
                         },
                         actions = {
                             IconButton(onClick = { vm.refreshAll() }) {
-                                Icon(Icons.Rounded.Refresh, contentDescription = null)
+                                Icon(Icons.Rounded.Refresh, contentDescription = strings.refresh)
                             }
                         },
                     )
@@ -121,9 +132,9 @@ private fun SiloRootHost(vm: SiloViewModel = viewModel()) {
                             }
                             NavigationBarItem(
                                 selected = currentTab == tab,
-                                onClick = { currentTab = tab },
+                                onClick = { currentTabName = tab.name },
                                 icon = { Icon(tab.icon, contentDescription = label) },
-                                label = { Text(label, maxLines = 1) },
+                                label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             )
                         }
                     }

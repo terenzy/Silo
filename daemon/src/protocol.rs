@@ -5,7 +5,8 @@ use crate::config::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const MAX_IPC_LINE_BYTES: usize = 512 * 1024;
+pub const MAX_IPC_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_IPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Raw wire envelope avoiding `#[serde(flatten)]` (which broke `BTreeMap<u32, _>` in v1.0.0!).
 #[derive(Debug, Clone, Deserialize)]
@@ -585,6 +586,15 @@ pub struct PrivateDnsState {
     pub specifier: String,
 }
 
+impl Default for PrivateDnsState {
+    fn default() -> Self {
+        Self {
+            mode: "opportunistic".to_string(),
+            specifier: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SensorPrivacyState {
     pub mic_muted: bool,
@@ -605,6 +615,14 @@ pub struct CategoryPermLiveState {
     pub appops_mode: String,
     pub last_access: Option<String>,
     pub running_now: bool,
+    #[serde(default)]
+    pub runtime_granted: Option<bool>,
+    #[serde(default)]
+    pub has_runtime_perms: bool,
+    #[serde(default)]
+    pub supports_foreground: bool,
+    #[serde(default)]
+    pub system_fixed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -668,6 +686,8 @@ pub struct DaemonStatus {
     pub temp_unblocks_remaining: BTreeMap<u32, u64>,
     pub capabilities: KernelCapabilities,
     pub last_firewall_error: Option<String>,
+    #[serde(default)]
+    pub panic_lockdown_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,5 +922,108 @@ mod tests {
             r10.command,
             DaemonCommand::GetPrivacyAccessLog { limit: Some(50) }
         ));
+    }
+
+    #[test]
+    fn ipc_framing_constants_support_full_50k_blocklist() {
+        assert_eq!(MAX_IPC_LINE_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_IPC_RESPONSE_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn category_perm_live_state_backward_compatible_deserialization() {
+        let legacy = r#"{"category":"camera","appops_mode":"ignore","last_access":"2m","running_now":false}"#;
+        let parsed: CategoryPermLiveState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.category, "camera");
+        assert_eq!(parsed.appops_mode, "ignore");
+        assert_eq!(parsed.last_access.as_deref(), Some("2m"));
+        assert!(!parsed.running_now);
+        assert_eq!(parsed.runtime_granted, None);
+        assert!(!parsed.has_runtime_perms);
+        assert!(!parsed.supports_foreground);
+        assert!(!parsed.system_fixed);
+
+        let full = CategoryPermLiveState {
+            category: "camera".to_string(),
+            appops_mode: "foreground".to_string(),
+            last_access: Some("+10s ago".to_string()),
+            running_now: true,
+            runtime_granted: Some(true),
+            has_runtime_perms: true,
+            supports_foreground: true,
+            system_fixed: false,
+        };
+        let encoded = serde_json::to_value(&full).unwrap();
+        assert_eq!(encoded["last_access"], "+10s ago");
+        assert_eq!(encoded["runtime_granted"], true);
+        assert_eq!(encoded["has_runtime_perms"], true);
+        assert_eq!(encoded["supports_foreground"], true);
+        assert_eq!(encoded["system_fixed"], false);
+        let roundtrip: CategoryPermLiveState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(roundtrip.runtime_granted, Some(true));
+        assert!(roundtrip.has_runtime_perms);
+        assert!(roundtrip.supports_foreground);
+        assert!(!roundtrip.system_fixed);
+    }
+
+    #[test]
+    fn daemon_status_includes_default_panic_lockdown_active() {
+        let legacy_status = serde_json::json!({
+            "version": "3.0.0",
+            "pid": 1234,
+            "uptime_secs": 10,
+            "boot_guard_armed": false,
+            "boot_guard_cleared": true,
+            "firewall_active": true,
+            "firewall_mode": "DefaultDeny",
+            "ipset_entries_loaded": 0,
+            "ipset_backend": "idle",
+            "vpn_active": false,
+            "active_interfaces": {"wifi": [], "cellular": [], "vpn": [], "other": []},
+            "screen_on": true,
+            "device_locked": false,
+            "ce_unlocked": true,
+            "sensors_off_active": false,
+            "mic_muted": false,
+            "camera_muted": false,
+            "frozen_uids_count": 0,
+            "suspended_pkgs_count": 0,
+            "blocked_events_total": 0,
+            "auto_reboot_remaining_secs": null,
+            "private_dns": {"mode": "opportunistic", "specifier": ""},
+            "radio_privacy": {
+                "enhanced_mac_randomization": false,
+                "disable_wifi_ble_scanning": false,
+                "disable_captive_portal": false,
+                "adb_enabled_live": false
+            },
+            "enforcer_rules_count": 0,
+            "enforcer_actions_count": 0,
+            "last_enforcer_event": null,
+            "temp_unblocks_remaining": {},
+            "capabilities": {
+                "kernel_release": "6.6.127",
+                "iptables_available": true,
+                "ip6tables_available": true,
+                "ipset_netlink_available": true,
+                "xt_set_available": true,
+                "xt_recent_available": true,
+                "nflog_available": true,
+                "ttl_target_available": true,
+                "hl_target_available": true,
+                "sock_destroy_available": true,
+                "cgroup_v2_freezer_available": true,
+                "available_tcp_congestion": []
+            },
+            "last_firewall_error": null
+        });
+        let mut status: DaemonStatus = serde_json::from_value(legacy_status).unwrap();
+        assert!(!status.panic_lockdown_active);
+
+        status.panic_lockdown_active = true;
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["panic_lockdown_active"], true);
+        let decoded: DaemonStatus = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.panic_lockdown_active);
     }
 }

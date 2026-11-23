@@ -3,27 +3,135 @@ package dev.silo.app.ui.screens
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.silo.app.ipc.BlockAction
 import dev.silo.app.ipc.FirewallMode
 import dev.silo.app.ipc.LiveProofReport
 import dev.silo.app.ipc.SecurityPreset
+import dev.silo.app.ipc.SiloConfig
+import dev.silo.app.ui.SheetFeedback
 import dev.silo.app.ui.SiloUiState
 import dev.silo.app.ui.SiloViewModel
 import dev.silo.app.ui.i18n.LocalSiloStrings
 import dev.silo.app.ui.theme.*
+
+/**
+ * Exact 4-preset posture matcher aligned with `daemon/src/config.rs:545-617` (APP-H15).
+ * Returns `null` for custom/partial configs or whenever Panic Lockdown override is active.
+ * `autoRebootEnabled` is intentionally excluded because BFU Auto-Reboot is always a manual opt-in.
+ */
+fun matchSecurityPreset(
+    config: SiloConfig,
+    panicLockdownActive: Boolean = config.firewall.panicLockdownActive,
+): SecurityPreset? {
+    val fw = config.firewall
+    val h = config.hardening
+    val sc = config.scopes
+    val auto = config.automation
+    val fz = config.freezer
+
+    if (panicLockdownActive || fw.panicLockdownActive) return null
+
+    val isSafe = !fw.enabled &&
+        fw.mode == FirewallMode.DEFAULT_ALLOW &&
+        !fw.isolateLan &&
+        !fw.dnsLeakGuard &&
+        !fw.ipv6LeakGuard &&
+        !fw.blockCleartextHttpGlobal &&
+        !fw.antiPortScan &&
+        !fw.normalizeTtlHl &&
+        !fw.blockNewApps &&
+        !h.enabled &&
+        !fz.enabled &&
+        !sc.autoClearClipboard &&
+        !auto.sensorsOffOnLock &&
+        !auto.usbAdbLockGuard &&
+        !auto.wifiAutoOffEnabled &&
+        !auto.bluetoothAutoOffEnabled
+    if (isSafe) return SecurityPreset.SAFE
+
+    val isBalanced = fw.enabled &&
+        fw.mode == FirewallMode.DEFAULT_ALLOW &&
+        fw.isolateLan &&
+        fw.dnsLeakGuard &&
+        fw.ipv6LeakGuard &&
+        fw.antiPortScan &&
+        !fw.blockCleartextHttpGlobal &&
+        !fw.normalizeTtlHl &&
+        !fw.blockNewApps &&
+        h.enabled &&
+        h.disableTcpTimestamps &&
+        h.hardenMemoryAndPtrace &&
+        h.ipv6PrivacyExtensions &&
+        sc.autoClearClipboard &&
+        sc.clipboardClearSecs == 60 &&
+        !auto.sensorsOffOnLock &&
+        !auto.usbAdbLockGuard &&
+        !auto.wifiAutoOffEnabled &&
+        !auto.bluetoothAutoOffEnabled
+    if (isBalanced) return SecurityPreset.BALANCED
+
+    val allHardeningFlags = h.enabled &&
+        h.hideKernelPointers &&
+        h.restrictPerfEvents &&
+        h.disableUnprivilegedBpf &&
+        h.hardenBpfJit &&
+        h.disableSuidDumpable &&
+        h.protectFsLinksFifos &&
+        h.restrictDmesg &&
+        h.disableTcpTimestamps &&
+        h.hardenNetworkStack &&
+        h.hardenMemoryAndPtrace &&
+        h.ipv6PrivacyExtensions
+
+    val hardenedNetAndBase = fw.enabled &&
+        fw.isolateLan &&
+        fw.dnsLeakGuard &&
+        fw.ipv6LeakGuard &&
+        fw.antiPortScan &&
+        fw.blockCleartextHttpGlobal &&
+        fw.normalizeTtlHl &&
+        fw.ttlValue == 64 &&
+        fw.blockNewApps &&
+        allHardeningFlags &&
+        sc.autoClearClipboard &&
+        auto.sensorsOffOnLock
+
+    val isHardened = hardenedNetAndBase &&
+        fw.mode == FirewallMode.DEFAULT_ALLOW &&
+        sc.clipboardClearSecs == 45 &&
+        !auto.usbAdbLockGuard &&
+        !auto.wifiAutoOffEnabled &&
+        !auto.bluetoothAutoOffEnabled
+    if (isHardened) return SecurityPreset.HARDENED
+
+    val isParanoid = hardenedNetAndBase &&
+        fw.mode == FirewallMode.DEFAULT_DENY &&
+        fw.blockAction == BlockAction.REJECT &&
+        sc.clipboardClearSecs == 30 &&
+        auto.wifiAutoOffEnabled &&
+        auto.bluetoothAutoOffEnabled &&
+        auto.usbAdbLockGuard
+    if (isParanoid) return SecurityPreset.PARANOID
+
+    return null
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -35,6 +143,8 @@ fun HomeScreen(
     var showPanicRebootDialog by remember { mutableStateOf(false) }
     var showPanicLockdownDialog by remember { mutableStateOf(false) }
     var showProofSheet by remember { mutableStateOf(false) }
+
+    val isPanicActive = state.status.panicLockdownActive || state.config.firewall.panicLockdownActive
 
     if (showPanicLockdownDialog) {
         AlertDialog(
@@ -48,7 +158,7 @@ fun HomeScreen(
                     onClick = {
                         showPanicLockdownDialog = false
                         vm.triggerPanicLockdown()
-                    }
+                    },
                 ) { Text(s.confirmLockdown) }
             },
             dismissButton = {
@@ -69,7 +179,7 @@ fun HomeScreen(
                     onClick = {
                         showPanicRebootDialog = false
                         vm.triggerPanicReboot()
-                    }
+                    },
                 ) { Text(s.confirmReboot) }
             },
             dismissButton = {
@@ -79,12 +189,20 @@ fun HomeScreen(
     }
 
     if (showProofSheet) {
+        val proofSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
-            onDismissRequest = { showProofSheet = false },
+            onDismissRequest = {
+                showProofSheet = false
+                vm.clearSheetFeedback()
+            },
+            sheetState = proofSheetState,
             containerColor = MaterialTheme.colorScheme.surface,
         ) {
             LiveProofSheetContent(
                 proof = state.liveProof,
+                loading = state.liveProofLoading,
+                feedback = state.sheetFeedback,
+                onDismissFeedback = { vm.clearSheetFeedback() },
                 onRefresh = { vm.runLiveProof() },
             )
         }
@@ -123,9 +241,10 @@ fun HomeScreen(
 
         // Minimalist Hero Posture + Master Switch
         item {
-            val score = state.sentinelReport?.score ?: 0
+            val score = state.sentinelReport?.score
+            val mutedColor = MaterialTheme.colorScheme.onSurfaceVariant
             val scoreColor = when {
-                !state.connected -> MaterialTheme.colorScheme.onSurfaceVariant
+                !state.connected || score == null -> mutedColor
                 score >= 85 -> SiloEmerald
                 score >= 65 -> SiloAmber
                 else -> SiloCrimson
@@ -154,90 +273,122 @@ fun HomeScreen(
                         }
                         Switch(
                             checked = fwOn,
-                            onCheckedChange = { on -> vm.updateFirewallConfig { it.copy(enabled = on) } },
+                            enabled = state.connected,
+                            onCheckedChange = { on ->
+                                vm.updateFirewallConfig {
+                                    it.copy(
+                                        enabled = on,
+                                        panicLockdownActive = if (on) it.panicLockdownActive else false,
+                                    )
+                                }
+                            },
                         )
                     }
 
-                    // Minimalist inline stats strip (borderless tonal pills)
+                    if (state.connected && isPanicActive) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = SiloCrimson.copy(alpha = 0.16f),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Icon(Icons.Rounded.GppBad, contentDescription = null, tint = SiloCrimson, modifier = Modifier.size(16.dp))
+                                Text(
+                                    s.panicLockdownActiveBanner,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = SiloCrimson,
+                                )
+                            }
+                        }
+                    }
+
+                    // Minimalist inline stats strip (shows "--" when offline or score pending, APP-M12/L07)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         StatTile(
                             modifier = Modifier.weight(1f),
-                            value = if (state.connected) "$score" else "--",
+                            value = if (state.connected && score != null) "$score" else "--",
                             label = s.securityScore,
                             accent = scoreColor,
                         )
                         StatTile(
                             modifier = Modifier.weight(1f),
-                            value = state.status.blockedEventsTotal.toString(),
+                            value = if (state.connected) state.status.blockedEventsTotal.toString() else "--",
                             label = s.metricBlocked,
-                            accent = SiloCyan,
+                            accent = if (state.connected) SiloCyan else mutedColor,
                         )
                         StatTile(
                             modifier = Modifier.weight(1f),
-                            value = "${state.status.frozenUidsCount + state.status.suspendedPkgsCount}",
+                            value = if (state.connected) "${state.status.frozenUidsCount + state.status.suspendedPkgsCount}" else "--",
                             label = s.metricFrozen,
-                            accent = SiloEmerald,
+                            accent = if (state.connected) SiloEmerald else mutedColor,
                         )
                         StatTile(
                             modifier = Modifier.weight(1f),
-                            value = "${state.status.enforcerRulesCount}",
+                            value = if (state.connected) "${state.status.enforcerRulesCount}" else "--",
                             label = s.metricEnforced,
-                            accent = SiloAmber,
+                            accent = if (state.connected) SiloAmber else mutedColor,
                         )
                     }
 
-                    // Compact status footer
-                    val dnsLabel = when (state.status.privateDns.mode) {
-                        "hostname" -> state.status.privateDns.specifier
-                        "off" -> s.dnsOff
-                        else -> s.dnsAuto
-                    }
-                    val bootText = if (state.status.bootGuardCleared) s.bootGuardOk else s.bootGuardArmed
-                    Text(
-                        "$bootText  •  DNS: $dnsLabel",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-
-                    state.status.lastEnforcerEvent?.let { ev ->
+                    // Live status footer hidden while daemon is offline (APP-L07)
+                    if (state.connected) {
+                        val dnsLabel = when (state.status.privateDns.mode) {
+                            "hostname" -> state.status.privateDns.specifier
+                            "off" -> s.dnsOff
+                            else -> s.dnsAuto
+                        }
+                        val bootText = if (state.status.bootGuardCleared) s.bootGuardOk else s.bootGuardArmed
                         Text(
-                            ev,
+                            "$bootText  •  DNS: $dnsLabel",
                             style = MaterialTheme.typography.labelSmall,
-                            color = SiloEmerald,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                    }
 
-                    state.status.lastFirewallError?.let { err ->
-                        Text(
-                            err,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = SiloAmber,
-                        )
+                        state.status.lastEnforcerEvent?.let { ev ->
+                            Text(
+                                ev,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SiloEmerald,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+
+                        state.status.lastFirewallError?.let { err ->
+                            Text(
+                                err,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SiloAmber,
+                            )
+                        }
                     }
                 }
             }
         }
 
-        // Live Hardware Controls (separated real-time Mic & Camera + Panic Lockdown + Live Proof)
+        // Live Hardware Controls
         item {
             SiloSectionLabel(s.quickActions)
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                // Row 1: Separated LIVE Mic & Camera toggles backed by dumpsys sensor_privacy
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
                         icon = if (state.status.micMuted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                         title = s.muteMic,
                         subtitle = if (state.status.micMuted) s.stateMuted else s.stateLive,
-                        active = state.status.micMuted,
+                        active = state.connected && state.status.micMuted,
                         accent = SiloAmber,
+                        enabled = state.connected,
                         onClick = { vm.setSensorPrivacy("microphone", !state.status.micMuted) },
                     )
                     QuickActionTile(
@@ -245,13 +396,14 @@ fun HomeScreen(
                         icon = if (state.status.cameraMuted) Icons.Rounded.VideocamOff else Icons.Rounded.Videocam,
                         title = s.muteCamera,
                         subtitle = if (state.status.cameraMuted) s.stateMuted else s.stateLive,
-                        active = state.status.cameraMuted,
+                        active = state.connected && state.status.cameraMuted,
                         accent = SiloAmber,
+                        enabled = state.connected,
                         onClick = { vm.setSensorPrivacy("camera", !state.status.cameraMuted) },
                     )
                 }
-                // Row 2: Wipe Clipboard & Live Kernel Proof
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // Wipe Clipboard works natively via Android ClipboardManager even when daemon is offline!
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
                         icon = Icons.Rounded.ContentPasteOff,
@@ -259,6 +411,7 @@ fun HomeScreen(
                         subtitle = "Android Native",
                         active = false,
                         accent = SiloCyan,
+                        enabled = true,
                         onClick = { vm.clearClipboardNow() },
                     )
                     QuickActionTile(
@@ -266,25 +419,32 @@ fun HomeScreen(
                         icon = Icons.Rounded.Verified,
                         title = s.liveProof,
                         subtitle = "iptables • appops",
-                        active = state.liveProof?.ipv4HookAttached == true,
+                        active = state.connected && state.liveProof?.ipv4HookAttached == true,
                         accent = SiloEmerald,
+                        enabled = state.connected,
                         onClick = {
-                            vm.runLiveProof { showProofSheet = true }
+                            vm.clearSheetFeedback()
                             showProofSheet = true
+                            vm.runLiveProof()
                         },
                     )
                 }
-                // Row 3: Panic Lockdown (Non-Destructive) & Emergency Reboot BFU
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     QuickActionTile(
                         modifier = Modifier.weight(1f),
                         icon = Icons.Rounded.GppBad,
                         title = s.panicLockdown,
                         subtitle = s.panicLockdownSub,
-                        active = state.config.firewall.enabled &&
-                            state.config.firewall.mode == FirewallMode.DEFAULT_DENY &&
-                            state.status.micMuted && state.status.cameraMuted,
+                        active = state.connected && (
+                            isPanicActive || (
+                                state.config.firewall.enabled &&
+                                    state.config.firewall.mode == FirewallMode.DEFAULT_DENY &&
+                                    state.status.micMuted &&
+                                    state.status.cameraMuted
+                                )
+                            ),
                         accent = SiloCrimson,
+                        enabled = state.connected,
                         onClick = { showPanicLockdownDialog = true },
                     )
                     QuickActionTile(
@@ -294,37 +454,70 @@ fun HomeScreen(
                         subtitle = "BFU Lock",
                         active = false,
                         accent = SiloCrimson,
+                        enabled = state.connected,
                         onClick = { showPanicRebootDialog = true },
                     )
                 }
             }
         }
 
-        // Quick Presets (Borderless grouped list)
+        // Quick Presets (Exact matcher + Custom/Panic badge, APP-H15)
         item {
-            SiloSectionLabel(s.presetsTitle)
+            val activePreset = matchSecurityPreset(state.config, isPanicActive)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SiloSectionLabel(s.presetsTitle)
+                if (state.connected && activePreset == null) {
+                    val badgeColor = if (isPanicActive) SiloCrimson else SiloCyan
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = badgeColor.copy(alpha = 0.16f),
+                    ) {
+                        Text(
+                            if (isPanicActive) s.panicLockdown else s.presetCustom,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = badgeColor,
+                        )
+                    }
+                }
+            }
             SiloGroup {
-                val fw = state.config.firewall
-                val isSafe = !fw.enabled && !state.config.hardening.enabled
-                val isLockdown = fw.enabled && fw.mode == FirewallMode.DEFAULT_DENY
-                val isHardened = fw.enabled && !isLockdown && fw.blockCleartextHttpGlobal
-                val isBalanced = fw.enabled && !isLockdown && !isHardened
-
-                PresetRow(s.presetSafe, s.presetSafeDesc, isSafe, SiloCyan) {
-                    vm.applyPreset(SecurityPreset.SAFE)
-                }
+                PresetRow(
+                    title = s.presetSafe,
+                    subtitle = s.presetSafeDesc,
+                    selected = state.connected && activePreset == SecurityPreset.SAFE,
+                    accent = SiloCyan,
+                    enabled = state.connected,
+                ) { vm.applyPreset(SecurityPreset.SAFE) }
                 SiloHairline()
-                PresetRow(s.presetBalanced, s.presetBalancedDesc, isBalanced, SiloEmerald) {
-                    vm.applyPreset(SecurityPreset.BALANCED)
-                }
+                PresetRow(
+                    title = s.presetBalanced,
+                    subtitle = s.presetBalancedDesc,
+                    selected = state.connected && activePreset == SecurityPreset.BALANCED,
+                    accent = SiloEmerald,
+                    enabled = state.connected,
+                ) { vm.applyPreset(SecurityPreset.BALANCED) }
                 SiloHairline()
-                PresetRow(s.presetHardened, s.presetHardenedDesc, isHardened, SiloAmber) {
-                    vm.applyPreset(SecurityPreset.HARDENED)
-                }
+                PresetRow(
+                    title = s.presetHardened,
+                    subtitle = s.presetHardenedDesc,
+                    selected = state.connected && activePreset == SecurityPreset.HARDENED,
+                    accent = SiloAmber,
+                    enabled = state.connected,
+                ) { vm.applyPreset(SecurityPreset.HARDENED) }
                 SiloHairline()
-                PresetRow(s.presetLockdown, s.presetLockdownDesc, isLockdown, SiloCrimson) {
-                    vm.applyPreset(SecurityPreset.PARANOID)
-                }
+                PresetRow(
+                    title = s.presetLockdown,
+                    subtitle = s.presetLockdownDesc,
+                    selected = state.connected && activePreset == SecurityPreset.PARANOID,
+                    accent = SiloCrimson,
+                    enabled = state.connected,
+                ) { vm.applyPreset(SecurityPreset.PARANOID) }
             }
             Text(
                 s.presetsSubtitle,
@@ -380,13 +573,15 @@ private fun QuickActionTile(
     subtitle: String,
     active: Boolean,
     accent: Color,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     val bg = if (active) accent.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface
     Surface(
         modifier = modifier
+            .alpha(if (enabled) 1f else 0.45f)
             .clip(RoundedCornerShape(18.dp))
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         shape = RoundedCornerShape(18.dp),
         color = bg,
     ) {
@@ -431,12 +626,14 @@ private fun PresetRow(
     subtitle: String,
     selected: Boolean,
     accent: Color,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .alpha(if (enabled) 1f else 0.45f)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -468,12 +665,16 @@ private fun PresetRow(
 @Composable
 fun LiveProofSheetContent(
     proof: LiveProofReport?,
+    loading: Boolean,
+    feedback: SheetFeedback?,
+    onDismissFeedback: () -> Unit,
     onRefresh: () -> Unit,
 ) {
     val s = LocalSiloStrings.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp)
             .padding(bottom = 28.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -483,48 +684,94 @@ fun LiveProofSheetContent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(s.runLiveProofRow, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            IconButton(onClick = onRefresh) {
-                Icon(Icons.Rounded.Refresh, contentDescription = null)
+            Text(
+                s.runLiveProofRow,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onRefresh, enabled = !loading) {
+                Icon(Icons.Rounded.Refresh, contentDescription = s.refresh)
             }
         }
 
-        if (proof == null) {
-            Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(strokeWidth = 2.dp)
+        feedback?.let { fb ->
+            SiloInlineFeedbackBanner(
+                message = fb.message,
+                isError = fb.isError,
+                onDismiss = onDismissFeedback,
+            )
+        }
+
+        if (loading && proof != null) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+
+        when {
+            loading && proof == null -> {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                }
             }
-        } else {
-            SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)) {
-                proof.items.forEachIndexed { idx, item ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Icon(
-                            if (item.verified) Icons.Rounded.CheckCircle else Icons.Rounded.WarningAmber,
-                            contentDescription = null,
-                            tint = if (item.verified) SiloEmerald else SiloAmber,
-                            modifier = Modifier.size(19.dp),
-                        )
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                item.subsystem,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            Text(
-                                item.evidence,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+
+            proof == null -> {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        s.liveProofUnavailable,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FilledTonalButton(onClick = onRefresh, shape = RoundedCornerShape(12.dp)) {
+                        Text(s.retryAction)
                     }
-                    if (idx < proof.items.lastIndex) SiloHairline()
+                }
+            }
+
+            else -> {
+                SiloGroup(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)) {
+                    proof.items.forEachIndexed { idx, item ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                if (item.verified) Icons.Rounded.CheckCircle else Icons.Rounded.WarningAmber,
+                                contentDescription = null,
+                                tint = if (item.verified) SiloEmerald else SiloAmber,
+                                modifier = Modifier.size(19.dp),
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    item.subsystem,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                Text(
+                                    item.evidence,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        if (idx < proof.items.lastIndex) SiloHairline()
+                    }
                 }
             }
         }
     }
 }
+

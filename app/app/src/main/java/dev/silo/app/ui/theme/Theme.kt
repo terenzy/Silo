@@ -4,6 +4,10 @@ import android.os.Build
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -16,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.silo.app.data.AppThemePref
+import dev.silo.app.ui.i18n.LocalSiloStrings
 
 val SiloEmerald = Color(0xFF10B981)
 val SiloCyan = Color(0xFF38BDF8)
@@ -256,3 +261,56 @@ fun <T> SiloSegmentBar(
         }
     }
 }
+
+/**
+ * Visible inline feedback banner rendered inside ModalBottomSheets so error and confirmation
+ * messages are never hidden behind the sheet's separate Android Dialog window (APP-C06).
+ */
+@Composable
+fun SiloInlineFeedbackBanner(
+    message: String,
+    isError: Boolean,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = LocalSiloStrings.current
+    val accent = if (isError) SiloCrimson else SiloEmerald
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = accent.copy(alpha = 0.16f),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                if (isError) Icons.Rounded.ErrorOutline else Icons.Rounded.CheckCircle,
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.minimumInteractiveComponentSize(),
+            ) {
+                Icon(
+                    Icons.Rounded.Close,
+                    contentDescription = s.dismiss,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+    }
+}
+

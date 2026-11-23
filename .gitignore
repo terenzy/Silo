@@ -20,3 +20,12 @@ out/
 *.zip
 *.sha256
 .DS_Store
+
+# Python (E2E test suite)
+__pycache__/
+*.py[cod]
+
+# Secrets / env
+.env
+.env.*
+node_modules/
